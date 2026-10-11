@@ -1,0 +1,26 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${GAME_FIXES_VERSION}",
+	"name": "game_fixes",
+	"description": "The CS2 server fixes of the GameFixes fork (ezekutor/game_fixes, formerly SlynxCZ/GameFixes_mm) as one Plugify plugin, each toggled in configs/game_fixes/game_fixes.ini: beam_crash (CBeam::SetBeamOrigin/SetBeamEndPos loop on a parentless beam), demo_record (GOTV client kept, session maxplayers +1), hammer_id (SetSchemaHammerUniqueId patched jnz->jmp), slow_animation (empty-server map reload by reload_interval, mp_timelimit carried over), workshop_voice (distinct per-listener xuid in svc_VoiceData), steam_ban (whitelist + cooldown stripping in the engine's GC-ban pass), team_limit (spawnable/max T and CT raised to maxplayers every round_start), input_activator_crash (TestActivator without an activator dropped), sv_cheats (noclip pawns back to MOVETYPE_WALK when it turns off), rampbug (CS2KZ's TryPlayerMove ramp fix), water_jump (the CategorizePosition after WaterMove skipped), keyvalues_flood, team_switch_spam and voice_flood (message rate limits). Hooks run through the polyhook plugin (reusing s2sdk's hooks where they exist); signatures/offsets/vtables/the one byte patch live in assets/gamedata.jsonc. server_list_players is NOT ported: s2sdk already pushes player data to the Steam game server API every 5 seconds.",
+	"author": "Slynx, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/game_fixes",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "polyhook",
+			"constraints": ">=2.5.6"
+		},
+		{
+			"name": "hudmenu",
+			"optional": true
+		}
+	]
+}

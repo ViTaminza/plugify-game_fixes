@@ -1,0 +1,269 @@
+{
+  // game_fixes gamedata — s2sdk gamedata format, loaded with s2sdk LoadGameConfigFile /
+  // GetGameConfigSignature / GetGameConfigVTable / GetGameConfigOffset.
+  //
+  // Provenance:
+  //  * CBeam_*, CEntityIdentity_AcceptInput, SetSchemaHammerUniqueId, GameSystem_Think_CheckSteamBan and
+  //    CCSGameRules_sm_mapGcBanInformation come from the GameFixes fork itself and its upstreams
+  //    (CS2Fixes, GameBanFix).
+  //  * CCSPlayer_MovementServices_* come from SwiftlyS2's maintained per-build gamedata
+  //    (gamedata/cs2/core/signatures.jsonc) — identical to the fork's patterns in its source.
+  //  * CEntityInstance_AcceptInput comes from s2sdk's own gamedata (the entry point its AcceptInput
+  //    binding calls) — the plugin keeps its own copy so the lookup cannot be skipped by the order
+  //    the loaded configs are iterated in.
+  // Every linuxsteamrt64 pattern below is verified against the shipped libserver.so by
+  // tests/signature_check_tests.cpp (see SIGSCAN.md): exactly one match. Windows values are
+  // copied where the upstream file has them; this port only ships linuxsteamrt64.
+  "$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify-plugin-s2sdk/refs/heads/main/schemas/gamedata.schema.json",
+  "csgo": {
+    "Signatures": {
+      // void CBeam::SetBeamOrigin(const Vector* pVecPosition)
+      "CBeam_SetBeamOrigin": {
+        "library": "server",
+        "win64": "48 89 5C 24 ? 57 48 81 EC ? ? ? ? 48 8B FA 48 8B D9 E8 ? ? ? ? 48 8B CB",
+        "linuxsteamrt64": "55 48 89 E5 41 54 49 89 F4 53 48 89 FB 48 83 EC ? 0F 1F 80"
+      },
+      // void CBeam::SetBeamEndPos(const Vector* pVecPosition)
+      "CBeam_SetBeamEndPos": {
+        "library": "server",
+        "win64": "48 8B C4 48 89 58 ? 57 48 81 EC ? ? ? ? 0F 29 70 ? 48 8B FA 0F 29 78 ? 48 8B D9",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 89 FB 48 81 EC ? ? ? ? 66 0F 1F 44 00"
+      },
+      // bool CEntityIdentity::AcceptInput(CUtlSymbolLarge* pInputName, CEntityInstance* pActivator, ...)
+      "CEntityIdentity_AcceptInput": {
+        "library": "server",
+        "win64": "48 89 54 24 ? 48 89 4C 24 ? 55 53 56 57 41 55 41 56 41 57 48 8D 6C 24",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 4C 8D BD ? ? ? ? 4D 89 CE"
+      },
+      // void CEntityInstance::AcceptInput(CEntityInstance* self, const char* pInputName,
+      //     CEntityInstance* pActivator, CEntityInstance* pCaller, variant_t* pValue, int nOutputID, ...)
+      "CEntityInstance_AcceptInput": {
+        "library": "server",
+        "win64": "48 89 5C 24 ? 48 89 6C 24 ? 56 57 41 56 48 81 EC ? ? ? ? 4D 8B F0 48 8B F1",
+        "linuxsteamrt64": "55 48 89 E5 41 57 49 89 FF 41 56 48 8D BD ? ? ? ? 41 55 4C 8D AD"
+      },
+      // SetSchemaHammerUniqueId: the pattern starts on the `jnz` that skips m_sUniqueHammerID
+      // being written; the Patches block below turns that byte into a `jmp`.
+      "SetSchemaHammerUniqueId": {
+        "library": "server",
+        "win64": "75 ? 48 8B 03 48 8B CB FF 90 ? ? ? ? 84 C0 74 ? 48 8D 05",
+        "linuxsteamrt64": "75 ? 48 8B 03 48 89 DF FF 90 ? ? ? ? 84 C0 74 ? 48 8D 05"
+      },
+      // void CCSPlayer_MovementServices::ProcessMovement(void* pMove)
+      "CCSPlayer_MovementServices_ProcessMovement": {
+        "library": "server",
+        "win64": "40 57 41 57 48 81 EC ? ? ? ? 48 83 79",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 83 EC ? 48 8B 7F"
+      },
+      // void CCSPlayer_MovementServices::TryPlayerMove(CMoveData* mv, Vector* pFirstDest, trace_t* pFirstTrace, bool* bIsSurfing)
+      "CCSPlayer_MovementServices_TryPlayerMove": {
+        "library": "server",
+        "win64": "48 8B C4 4C 89 48 ? 4C 89 40 ? 48 89 50 ? 48 89 48 ? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 0F 29 70",
+        "linuxsteamrt64": "48 B8 ? ? ? ? ? ? ? ? 55 66 0F EF C0 48 89 E5 41 57 41 56 49 89 F6"
+      },
+      // void CCSPlayer_MovementServices::CategorizePosition(CMoveData* mv, bool bStayOnGround)
+      "CCSPlayer_MovementServices_CategorizePosition": {
+        "library": "server",
+        "win64": "40 55 56 57 41 54 41 55 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B F9",
+        "linuxsteamrt64": "48 B8 ? ? ? ? ? ? ? ? 55 66 0F EF C0 48 89 E5 41 57 41 56 41 55 41 89 D5"
+      },
+      // void CCSPlayer_MovementServices::WaterMove(CMoveData* mv)
+      "CCSPlayer_MovementServices_WaterMove": {
+        "library": "server",
+        "win64": "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 4C 89 60 20 55 41 56 41 57 48 8D A8 68 FE FF FF",
+        "linuxsteamrt64": "48 B8 ? ? ? ? ? ? ? ? 55 66 0F EF C0 48 89 E5 41 57 41 56 41 55 4C 8D AD ? ? ? ? 41 54 49 89 FC 4C 89 EF 53 48 89 F3 48 81 EC ? ? ? ? 48 89 85 ? ? ? ? 48 8B 05 ? ? ? ? 0F 29 85 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 48 C7 45 ? ? ? ? ? 48 89 85 ? ? ? ? 48 B8 ? ? ? ? ? ? ? ? 48 89 45 ? E8 ? ? ? ? 48 8D 8D"
+      },
+      // void GameSystem_Think_CheckSteamBan() — the engine's per-frame GC-ban / cooldown kick pass.
+      "GameSystem_Think_CheckSteamBan": {
+        "library": "server",
+        "win64": "41 54 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 44 8B 60 58",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC ? 48 8B 05 ? ? ? ? 44 8B 68 ? 45 85 ED 0F 8E ? ? ? ? 8B 15"
+      },
+      // lea reg, [rip + sm_mapGcBanInformation] inside CCSGameRules; the map is the rip-relative operand.
+      "CCSGameRules_sm_mapGcBanInformation": {
+        "library": "server",
+        "win64": "48 8D 0D ? ? ? ? 0F 11 44 24 ? 0F 11 44 24 ? E8",
+        "linuxsteamrt64": "48 8D 35 ? ? ? ? 89 C2 48 63 46"
+      }
+    },
+    "Offsets": {
+      // --- vtable indices (Itanium ABI: index = vtable word); verified against the fork's own
+      // compiled member-function-pointer constants and SwiftlyS2's per-build offsets.jsonc. ---
+      // INetworkServerService::StartupServer (engine2, index 27)
+      "INetworkServerService_StartupServer_Index": {
+        "win64": 26,
+        "linuxsteamrt64": 27
+      },
+      // CServerSideClient virtuals (engine2)
+      "CServerSideClient_Disconnect_Index": {
+        "win64": 8,
+        "linuxsteamrt64": 8
+      },
+      "CServerSideClient_SendNetMessage_Index": {
+        "win64": 15,
+        "linuxsteamrt64": 16
+      },
+      "CServerSideClient_ProcessStringCmd_Index": {
+        "win64": 24,
+        "linuxsteamrt64": 26
+      },
+      "CServerSideClient_ProcessCmdKeyValues_Index": {
+        "win64": 33,
+        "linuxsteamrt64": 35
+      },
+      "CServerSideClient_ProcessVoiceData_Index": {
+        "win64": 37,
+        "linuxsteamrt64": 39
+      },
+      // CNavPhysicsInterface::Nav_TraceShape(ray, start, end, CTraceFilter*, trace_t*) (server)
+      "INavPhysicsInterface_Nav_TraceShape_Index": {
+        "win64": 5,
+        "linuxsteamrt64": 5
+      },
+      // --- engine structure offsets (linuxsteamrt64 from the fork's own headers/disassembly,
+      // cross-checked against SwiftlyS2's offsets.jsonc for the same build) ---
+      "CServerSideClientBase_m_nClientSlot": {
+        "win64": 72,
+        "linuxsteamrt64": 72
+      },
+      "CServerSideClientBase_m_nSignonState": {
+        "win64": 100,
+        "linuxsteamrt64": 100
+      },
+      "CServerSideClientBase_m_bFakePlayer": {
+        "win64": 160,
+        "linuxsteamrt64": 160
+      },
+      "CServerSideClientBase_m_UserID": {
+        "win64": 168,
+        "linuxsteamrt64": 168
+      },
+      "CServerSideClientBase_m_bIsHLTV": {
+        "win64": 322,
+        "linuxsteamrt64": 322
+      },
+      // CSplitScreenSlot/CPlayerSlot signon states: >= SIGNONSTATE_CONNECTED(2) means a client is on the way in.
+      "SIGNONSTATE_CONNECTED": {
+        "win64": 2,
+        "linuxsteamrt64": 2
+      },
+      // SVC_Messages::svc_VoiceData (netmessages.proto). The engine registers its user messages
+      // only once the server is up, so the id cannot be looked up at plugin load; this is the
+      // protocol constant the fork's own build carries (its DWARF shows 47). The registry lookup
+      // is still tried and preferred when it answers.
+      "SVC_Messages_svc_VoiceData": {
+        "win64": 47,
+        "linuxsteamrt64": 47
+      },
+      // GameSessionConfiguration_t::maxPlayers (CSVCMsg_GameSessionConfiguration::max_clients)
+      "GameSessionConfiguration_maxPlayers": {
+        "win64": 124,
+        "linuxsteamrt64": 124
+      },
+      // CMoveData mv: the fields the rampbug fix reads and writes, layout from the fork's own
+      // compiled CMoveDataBase (DWARF-verified).
+      "CMoveData_m_vecVelocity": {
+        "win64": 56,
+        "linuxsteamrt64": 56
+      },
+      "CMoveData_m_vecAbsOrigin": {
+        "win64": 200,
+        "linuxsteamrt64": 200
+      },
+      // --- protobuf message layouts the flood fixes inspect. The client message objects are
+      //     [CNetMessage][protobuf]; these are the offsets of the protobuf fields *within that
+      //     object*, read out of the fork's own compiled handlers (its inlined protobuf
+      //     accessors). The string length of a bytes field sits 0x18 bytes before the data its
+      //     (untagged) field pointer dereferences to - the same read the fork's code performs. ---
+      // CCLCMsg_VoiceData: _has_bits_ (audio = bit 0)
+      "CCLCMsg_VoiceData_hasBits": {
+        "win64": 64,
+        "linuxsteamrt64": 64
+      },
+      // CCLCMsg_VoiceData::audio_ (CMsgVoiceAudio*)
+      "CCLCMsg_VoiceData_audio": {
+        "win64": 72,
+        "linuxsteamrt64": 72
+      },
+      // CMsgVoiceAudio::packet_offsets (repeated; count stored inline at this offset)
+      "CMsgVoiceAudio_packetOffsets": {
+        "win64": 24,
+        "linuxsteamrt64": 24
+      },
+      // CMsgVoiceAudio::voice_data (bytes)
+      "CMsgVoiceAudio_voiceData": {
+        "win64": 48,
+        "linuxsteamrt64": 48
+      },
+      // CCLCMsg_CmdKeyValues::data (bytes)
+      "CCLCMsg_CmdKeyValues_data": {
+        "win64": 72,
+        "linuxsteamrt64": 72
+      },
+      // --- CCSGameRules::sm_mapGcBanInformation (CUtlOrderedMap<uint32, CGcBanInformation_t>):
+      //     offsets from the fork's compiled map operations (Count/FirstInorder/NextInorder/
+      //     RemoveAll inlined into its handlers). Nodes are 56 bytes: key (account id) at +0x10,
+      //     reason at +0x18. ---
+      "CCSGameRules_sm_mapGcBanInformation_Array": {
+        "win64": 16,
+        "linuxsteamrt64": 16
+      },
+      "CCSGameRules_sm_mapGcBanInformation_Allocated": {
+        "win64": 8,
+        "linuxsteamrt64": 8
+      },
+      "CCSGameRules_sm_mapGcBanInformation_Root": {
+        "win64": 24,
+        "linuxsteamrt64": 24
+      },
+      "CCSGameRules_sm_mapGcBanInformation_Count": {
+        "win64": 28,
+        "linuxsteamrt64": 28
+      },
+      "CCSGameRules_sm_mapGcBanInformation_FirstFree": {
+        "win64": 32,
+        "linuxsteamrt64": 32
+      },
+      "CCSGameRules_sm_mapGcBanInformation_LastAlloc": {
+        "win64": 36,
+        "linuxsteamrt64": 36
+      },
+      "CCSGameRules_sm_mapGcBanInformation_NodeStride": {
+        "win64": 56,
+        "linuxsteamrt64": 56
+      },
+      "CCSGameRules_sm_mapGcBanInformation_NodeKey": {
+        "win64": 16,
+        "linuxsteamrt64": 16
+      },
+      "CCSGameRules_sm_mapGcBanInformation_NodeReason": {
+        "win64": 24,
+        "linuxsteamrt64": 24
+      }
+    },
+    "VTables": {
+      "CServerSideClient": {
+        "library": "engine2",
+        "table": "CServerSideClient"
+      },
+      "CTraceFilter": {
+        "library": "server",
+        "table": "CTraceFilter"
+      },
+      "CNavPhysicsInterface": {
+        "library": "server",
+        "table": "CNavPhysicsInterface"
+      }
+    },
+    "Patches": {
+      // hammer_id: SetSchemaHammerUniqueId skips m_sUniqueHammerID behind a jnz; turn it into a jmp
+      // so every entity gets its id. (s2sdk's own gamedata carries the same patch commented out, so
+      // nothing else applies it.)
+      "SetHammerUniqueIdJmp": {
+        "signature": "SetSchemaHammerUniqueId",
+        "win64": "EB",
+        "linuxsteamrt64": "EB"
+      }
+    }
+  }
+}
