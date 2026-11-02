@@ -10,11 +10,10 @@
 // and are stored in assets/gamedata.jsonc; the string lengths are read the way the fork's compiled code
 // reads them (untag the field pointer, follow it, the length sits 0x18 bytes before the data).
 
+#include "../config.hpp"
 #include "../fixes.hpp"
+#include "../map_gate.hpp"
 #include "../scheduler.hpp"
-
-#include <pisex/compat.hpp>
-#include <pisex/keyvalues.hpp>
 
 namespace game_fixes {
 namespace {
@@ -46,18 +45,15 @@ public:
 
 	const char* Name() const override { return "voice_flood"; }
 
-	void ReadConfig(const pisex::KeyValues& config) override {
-		m_maxPackets = config.GetInt("max_packets", 64);
-		m_maxBytes = config.GetInt("max_bytes", 4096);
-		m_maxPerSecond = config.GetInt("max_per_second", 128);
-		m_cooldown = config.GetFloat("cooldown", 5.0f);
-		m_kick = config.GetBool("kick", true);
-		m_kickStrikes = config.GetInt("kick_strikes", 3);
-		if (m_maxPackets < 16) m_maxPackets = 16;
-		if (m_maxBytes < 256) m_maxBytes = 256;
-		if (m_maxPerSecond < 64) m_maxPerSecond = 64;
-		if (m_cooldown < 0.0f) m_cooldown = 0.0f;
-		if (m_kickStrikes < 1) m_kickStrikes = 1;
+	void ReadConfig(const KvNode& config) override {
+		// The option names, defaults and floors live in src/config.hpp (pinned by the tests).
+		const config::VoiceFloodOptions options = config::ReadVoiceFlood(config);
+		m_maxPackets = options.maxPackets;
+		m_maxBytes = options.maxBytes;
+		m_maxPerSecond = options.maxPerSecond;
+		m_cooldown = options.cooldown;
+		m_kick = options.kick;
+		m_kickStrikes = options.kickStrikes;
 	}
 
 	bool Load() override;
@@ -209,13 +205,13 @@ void CVoiceFloodFix::Refuse(void* client, ClientState& state, const char* reason
 	// The name/steam id are PlayerManager lookups; during shutdown they walk the emptied client
 	// list (s2sdk does not validate that).
 	std::string who = "(unknown)";
-	if (__s2sdk_GetClientName && pisex::IsGameReady()) {
+	if (__s2sdk_GetClientName && IsMapReady()) {
 		try {
 			who = std::string(std::string_view(s2sdk::GetClientName(slot)));
 		} catch (...) {
 		}
 	}
-	const auto steamId = (__s2sdk_GetClientSteamID64 && pisex::IsGameReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
+	const auto steamId = (__s2sdk_GetClientSteamID64 && IsMapReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
 
 	LogFix(Name(), Format("%s (slot %d, %llu): %s (%d this second), strike %d/%d, %s", who.c_str(), slot,
 						  static_cast<unsigned long long>(steamId), reason, state.inWindow, state.strikes,
@@ -235,7 +231,7 @@ void CVoiceFloodFix::Refuse(void* client, ClientState& state, const char* reason
 			return;
 		}
 		// Map shutdown/changelevel empties the client list; the s2sdk kick path does not check.
-		if (!pisex::IsGameReady()) {
+		if (!IsMapReady()) {
 			return;
 		}
 		void* current = s2sdk::PlayerSlotToClientPtr(slot);

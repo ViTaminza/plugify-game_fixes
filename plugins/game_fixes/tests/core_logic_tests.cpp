@@ -14,24 +14,61 @@
 //
 //   * slow_animation_logic.hpp — the max_map_hours watch: ghost controllers do not count as
 //     players, the curtime threshold, new-match detection, the round-end fallback and its warning
-//     schedule, and the curtime-reset check after a forced reload.
+//     schedule, and the curtime-reset check after a forced reload; plus the empty-server idle
+//     pause and the short last-human sample that keeps it meaningful at the 30-minute check.
 //
 //   * hook::EncodedIndex — the Itanium ABI member-pointer encoding every vtable hook of this
 //     plugin is keyed by (1 + 8 * index). A wrong value hooks the wrong function.
+//
+//   * map_gate.hpp — the PITFALLS B1/B2 readiness gate: shut before the first map, latched open by
+//     the first update after OnMapStart (or by the first update of a plugin loaded mid-map),
+//     closed by OnMapEnd and never re-opened by an update in the map-change window.
+//
+//   * kv1.hpp / config.hpp — the plugin's own KeyValues reader (comments, nested blocks, quoted and
+//     unquoted values, the shim's GetInt/GetFloat/GetBool semantics, malformed files) and the
+//     option readers of every configurable fix: every block of the shipped assets/game_fixes.ini
+//     is read, the documented defaults and floors hold when a key is missing, and the enabled flags
+//     match the shipped file.
+//
+//   * paths.hpp — the config lookup order that replaced pisex::ResolvePath.
+//
+//   * schema_cache.hpp — the map-gated, success-only schema offset cache that replaced
+//     pisex::SchemaOffset: no lookup while the gate is shut, a miss stays retryable, Clear()
+//     forgets.
+//
+//   * scheduler.cpp, additionally — the per-map delayed work dropped on OnMapEnd
+//     (ClearDelayedWork) and the >= 1/64 s delay floor (PITFALLS C.9).
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <unistd.h>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "ban_map.hpp"
+#include "blank_map_logic.hpp"
+#include "config.hpp"
+#include "cstv_logic.hpp"
+#include "fake_messages_logic.hpp"
+#include "jump_spam_logic.hpp"
+#include "kv1.hpp"
 #include "load_policy.hpp"
+#include "map_gate.hpp"
+#include "paths.hpp"
+#include "player_ghost_logic.hpp"
 #include "scheduler.hpp"
+#include "schema_cache.hpp"
 #include "slow_animation_logic.hpp"
+#include "sv_cheats_logic.hpp"
+#include "team_limit_logic.hpp"
+#include "voice_fix_logic.hpp"
 
 // api.hpp is needed for hook::EncodedIndex only; nothing out of it is called here, so the binding
 // globals it declares are never referenced.
@@ -405,6 +442,49 @@ void TestSlowAnimationConfig() {
 	Check(ClampConfig(8.5f, 10.0f, 1.5f).maxMapHours == 8.5f, "a value above 1 h is kept");
 }
 
+void TestSlowAnimationHumanStamp() {
+	using namespace game_fixes::slowanim;
+
+	// The short human sample: only a live map with a human on it refreshes the stamp (a sample
+	// from a map change must not - the level change itself is not a reason to keep the pause).
+	Check(RefreshLastHuman(1000.0, 1010.0, true, 2) == 1010.0,
+		  "a human on a live map refreshes the last-human stamp");
+	Check(RefreshLastHuman(1000.0, 1010.0, true, 0) == 1000.0, "an empty live map leaves the stamp alone");
+	Check(RefreshLastHuman(1000.0, 1010.0, false, 1) == 1000.0,
+		  "a sample taken while the map is torn down leaves the stamp alone");
+
+	// The empty-server reload waits kIdleBeforeReload after the last human.
+	Check(!EmptyLongEnough(1000.0 + kIdleBeforeReload - 1.0, 1000.0),
+		  "the idle pause holds just under kIdleBeforeReload");
+	Check(EmptyLongEnough(1000.0 + kIdleBeforeReload, 1000.0),
+		  "the idle pause is over at kIdleBeforeReload");
+	Check(EmptyLongEnough(1000.0, 0.0), "nobody was ever seen: nothing to wait for");
+
+	// The regression the short sample exists for: a stamp refreshed only by the reload_interval
+	// check (30 min by default) is already older than the pause when the next check comes around,
+	// even if the last player left a second before it, so the empty server was reloaded with no
+	// pause at all.
+	const double reloadInterval = 1800.0;
+	const double checkAt = 5000.0;
+	const double lastPlayerLeftAt = checkAt + reloadInterval - 10.0;
+	const double nextCheckAt = checkAt + reloadInterval;
+
+	double unchecked = RefreshLastHuman(0.0, checkAt, true, 1);
+	Check(EmptyLongEnough(nextCheckAt, unchecked),
+		  "without the short sample the pause is already over at the next check");
+
+	// With a sample every kHumanCheckInterval, the last sample with a human on is within one
+	// interval of the disconnect, so the pause really runs.
+	double sampled = unchecked;
+	for (double t = checkAt; t <= lastPlayerLeftAt; t += kHumanCheckInterval) {
+		sampled = RefreshLastHuman(sampled, t, true, 1);
+	}
+	Check(!EmptyLongEnough(nextCheckAt, sampled),
+		  "with the short sample the check still sees the recent human and waits the pause");
+	Check(EmptyLongEnough(lastPlayerLeftAt + kIdleBeforeReload, sampled),
+		  "the reload happens once the pause has really passed");
+}
+
 void TestSlowAnimationWatch() {
 	using namespace game_fixes::slowanim;
 
@@ -565,6 +645,138 @@ void TestSlowAnimationWatch() {
 	}
 }
 
+// ------------------------------------------------------------- team limit ------
+
+void TestTeamLimitFields() {
+	using namespace game_fixes::teamlimit;
+
+	// All six counters the reference raises; the two spawn-point counts are the ones the original
+	// fork omitted. Every value is maxplayers and every width is the schema's 4 bytes.
+	const auto writes = Writes(24);
+	Check(writes.size() == 6, "team_limit writes six CCSGameRules fields");
+	Check(kFieldSize == 4, "team_limit field width is int32 (sdk.json)");
+	std::unordered_set<std::string> names;
+	bool allMax = true;
+	for (const FieldWrite& write : writes) {
+		names.insert(write.field);
+		allMax = allMax && write.value == 24;
+	}
+	Check(names.size() == 6, "team_limit field names are distinct");
+	Check(allMax, "every team_limit field is raised to maxplayers");
+	Check(names.count("m_iSpawnPointCount_Terrorist") == 1 && names.count("m_iSpawnPointCount_CT") == 1,
+		  "team_limit includes both spawn-point counters");
+	Check(names.count("m_iNumSpawnableTerrorist") == 1 && names.count("m_iNumSpawnableCT") == 1 &&
+			  names.count("m_iMaxNumTerrorists") == 1 && names.count("m_iMaxNumCTs") == 1,
+		  "team_limit keeps the four original counters");
+}
+
+// --------------------------------------------------------------- sv_cheats -----
+
+void TestSvCheatsLogic() {
+	using namespace game_fixes::svcheats;
+
+	// V_atoi semantics: the leading number decides, and "false"/empty count as off.
+	Check(IsOffValue(""), "an empty convar value is off");
+	Check(IsOffValue("0"), "\"0\" is off");
+	Check(IsOffValue("0.0"), "\"0.0\" is off");
+	Check(IsOffValue("false"), "\"false\" is off");
+	Check(IsOffValue("False") && IsOffValue("FALSE"), "\"False\"/\"FALSE\" are off too (bool.TryParse)");
+	Check(!IsOffValue("1"), "\"1\" is on");
+	Check(!IsOffValue("true"), "\"true\" is on");
+	Check(!IsOffValue("2"), "\"2\" is on");
+	Check(!IsOffValue("nonsense"), "a value without a number is not a zero");
+
+	// Either field being NOCLIP means the pawn is still stuck; both WALK means nothing to do.
+	Check(NeedsReset(7, 2), "m_MoveType=NOCLIP needs a reset");
+	Check(NeedsReset(2, 7), "m_nActualMoveType=NOCLIP needs a reset even when m_MoveType is not");
+	Check(NeedsReset(7, 7), "both NOCLIP needs a reset");
+	Check(!NeedsReset(2, 2), "both WALK needs no reset");
+}
+
+// --------------------------------------------------------------- voice_fix -----
+
+void TestVoiceFixLogic() {
+	using namespace game_fixes::voicefix;
+
+	Check(HasAudioField(1), "_has_bits_ bit 0 is the audio field");
+	Check(!ShouldDrop(1), "a message with audio is kept");
+	Check(ShouldDrop(0), "a message with no audio field is dropped");
+	Check(ShouldDrop(2), "another field set without bit 0 is still no audio");
+	Check(IsVoiceDataMessage(47, 47), "the voice message id matches itself");
+	Check(!IsVoiceDataMessage(47, 46), "a different message id is not voice data");
+	Check(!IsVoiceDataMessage(0, 0), "message id 0 is never voice data");
+}
+
+// ------------------------------------------------------------- player_ghost ---
+
+void TestPlayerGhostLogic() {
+	using namespace game_fixes::playerghost;
+
+	Check(IsGhostCandidate(true, true, true, kTeamSpectator), "alive pawn on the spectator team is a ghost");
+	Check(!IsGhostCandidate(true, true, true, 2), "a T pawn is not a ghost");
+	Check(!IsGhostCandidate(true, true, true, kTeamNone), "a team-less pawn is not a ghost");
+	Check(!IsGhostCandidate(true, false, true, kTeamSpectator), "a dead pawn is not a ghost");
+	Check(!IsGhostCandidate(false, true, true, kTeamSpectator), "a client not in game is not touched");
+	Check(!IsGhostCandidate(true, true, false, kTeamSpectator), "a missing pawn is not touched");
+}
+
+// ----------------------------------------------------------- fake_messages -----
+
+void TestFakeMessagesLogic() {
+	using namespace game_fixes::fakemessages;
+
+	Check(IsChatCommand("say"), "say is chat");
+	Check(IsChatCommand("SAY"), "command matching is case-insensitive");
+	Check(IsChatCommand("say_team"), "say_team is chat");
+	Check(IsChatCommand("Say_Team"), "say_team matching is case-insensitive");
+	Check(!IsChatCommand("say_teamx"), "a longer command is not say_team");
+	Check(!IsChatCommand("jointeam"), "jointeam is not chat and must pass");
+	Check(!IsChatCommand(""), "an empty command is not chat");
+
+	Check(SignonAllowsChat(5), "signon SPAWN may chat");
+	Check(SignonAllowsChat(6), "signon FULL may chat");
+	Check(!SignonAllowsChat(4), "signon PRESPAWN may not chat");
+	Check(!SignonAllowsChat(0), "signon NONE may not chat");
+}
+
+// --------------------------------------------------------------- blank_map -----
+
+void TestBlankMapLogic() {
+	using namespace game_fixes::blankmap;
+
+	Check(NeedsRestart("", "de_dust2"), "an empty nextlevel with a map name restarts");
+	Check(!NeedsRestart("de_nuke", "de_dust2"), "a next map set means no restart");
+	Check(!NeedsRestart("", ""), "without a map name there is nothing to restart");
+	Check(RestartCommand("de_dust2", true) == "changelevel de_dust2", "a stock map uses changelevel");
+	Check(RestartCommand("3070904001", false) == "ds_workshop_changelevel 3070904001",
+		  "a workshop map uses ds_workshop_changelevel");
+}
+
+// ---------------------------------------------------------- cstv_bot_quota -----
+
+void TestCstvLogic() {
+	using namespace game_fixes::cstv;
+
+	Check(ShouldRejectCandidate(1, true, true), "HLTV is rejected while the selector runs");
+	Check(!ShouldRejectCandidate(0, true, true), "HLTV is not rejected outside bot selection");
+	Check(!ShouldRejectCandidate(1, false, true), "a missing controller is never rejected");
+	Check(!ShouldRejectCandidate(1, true, false), "a real bot is never rejected");
+	Check(EnterSelection(0) == 1, "entering selection raises the depth");
+	Check(LeaveSelection(1) == 0, "leaving selection lowers the depth");
+	Check(LeaveSelection(0) == 0, "a stray leave cannot arm the predicate");
+}
+
+// --------------------------------------------------------------- jump_spam -----
+
+void TestJumpSpamLogic() {
+	using namespace game_fixes::jumpspam;
+
+	Check(!ShouldCancelJump(kNoJumpTick, 0), "tick 0 is a real tick and does not match the initial -1");
+	Check(ShouldCancelJump(5, 5), "the second jump check of the same tick is cancelled");
+	Check(!ShouldCancelJump(4, 5), "a new tick may jump");
+	Check(RecordJump(7) == 7, "a jump records its move tick");
+}
+
 // ----------------------------------------------------------- load policy --------
 
 void TestLoadPolicy() {
@@ -608,6 +820,426 @@ void TestHandleValidity() {
 	Check(!game_fixes::IsValidHandle(-1), "-1 (INVALID_EHANDLE_INDEX) is not a valid handle");
 }
 
+
+// ---------------------------------------------------------------- KV1 reader ----
+
+void TestKv1() {
+	using game_fixes::KvNode;
+	using game_fixes::ParseKv1;
+
+	const std::string_view text =
+		"\xEF\xBB\xBF// leading comment\n"
+		"\"game_fixes\"\n"
+		"{\n"
+		"\t\"one\"\t\t\"1\"\n"
+		"\t\"nested\"\n"
+		"\t{\n"
+		"\t\t\"deep\" \"42\"\n"
+		"\t}\n"
+		"\t\"block_only\"\n"
+		"\t{\n"
+		"\t}\n"
+		"\t\"unquoted\" value // trailing comment\n"
+		"\t\"quoted\" \"a \\\"quoted\\\" value\"\n"
+		"\t\"float\" \"2.5\"\n"
+		"\t\"yes\" \"YES\"\n"
+		"}\n";
+	const auto root = ParseKv1(text);
+	Check(root.has_value(), "a well-formed KV1 document parses (with a BOM and comments)");
+	if (!root) {
+		return;
+	}
+	Check(root->name == "game_fixes", "the single top-level block becomes the parsed root");
+	Check(root->Children().size() == 7, "every child node of the root block is kept");
+	const KvNode* one = root->Find("one");
+	Check(one != nullptr && one->GetInt({}) == 1, "GetInt reads the node's own value");
+	Check(root->Find("ONE") == one, "Find is case-insensitive");
+	Check(root->Find("nested") != nullptr && root->Find("nested")->Find("deep") != nullptr &&
+			  root->Find("nested")->Find("deep")->GetInt({}) == 42,
+		  "nested blocks are parsed");
+	Check(root->Find("unquoted") != nullptr && root->Find("unquoted")->GetString({}) == "value",
+		  "an unquoted value ends at a trailing comment");
+	Check(root->Find("quoted") != nullptr && root->Find("quoted")->GetString({}) == "a \"quoted\" value",
+		  "escapes inside a quoted string are decoded");
+	Check(root->Find("float") != nullptr && root->Find("float")->GetFloat({}) == 2.5f,
+		  "GetFloat reads a float value");
+	Check(root->Find("float")->GetInt({}) == 2, "GetInt keeps Valve's atoi fallback on \"2.5\"");
+	Check(root->Find("yes")->GetBool({}), "\"YES\" is true for GetBool");
+	Check(!root->Find("block_only")->GetBool({}, false), "a block with no value reads the bool default");
+	Check(root->Find("missing") == nullptr, "an unknown key is not found");
+	Check(root->GetInt("missing", 7) == 7, "a missing key reads the int default");
+	Check(root->GetBool("one"), "a numeric value is read as a bool");
+	Check(root->GetString("missing", "def") == "def", "a missing key reads the string default");
+
+	// The bool spellings the shim accepted.
+	const auto bools = ParseKv1("\"b\" { \"on\" \"on\" \"off\" \"OFF\" \"yes\" \"yes\" \"no\" \"no\" "
+								"\"num\" \"1\" \"str\" \"abc\" }");
+	Check(bools.has_value(), "the bool fixture parses");
+	if (bools) {
+		Check(bools->GetBool("on") && bools->GetBool("off", true) == false, "on/off spellings");
+		Check(bools->GetBool("yes") && !bools->GetBool("no", true), "yes/no spellings");
+		Check(bools->GetBool("num") && !bools->GetBool("str"), "numbers decide, text does not");
+	}
+
+	// Malformed documents are rejected as a whole: a half-read tree must never be used.
+	Check(!ParseKv1("\"a\" \"b\" }").has_value(), "a stray top-level '}' is malformed");
+	Check(!ParseKv1("\"a\" { \"b\" \"c\"").has_value(), "a missing '}' is malformed");
+	Check(!ParseKv1("\"a\" \"unterminated").has_value(), "an unterminated string is malformed");
+	Check(ParseKv1("").has_value() && ParseKv1("")->Children().empty(),
+		  "an empty file parses to an empty tree");
+}
+
+// --------------------------------------------------------------- config --------
+// The path of the shipped config: the tests parse the real file, so a broken block or a changed
+// default fails the suite. CMake passes it explicitly; the __FILE__ fallback keeps a manual /tmp
+// build working.
+std::string TestConfigPath() {
+#ifdef GAME_FIXES_TEST_CONFIG
+	return GAME_FIXES_TEST_CONFIG;
+#else
+	const std::string file = __FILE__;
+	const std::size_t tests = file.find("/tests/");
+	return (tests == std::string::npos ? std::string(".") : file.substr(0, tests)) + "/assets/game_fixes.ini";
+#endif
+}
+
+void TestConfigReaders() {
+	using namespace game_fixes;
+
+	const auto tree = LoadKv1File(TestConfigPath());
+	Check(tree.has_value(), "the shipped game_fixes.ini parses with the plugin's own KV1 reader");
+	if (!tree) {
+		return;
+	}
+	Check(tree->Children().size() == config::kFixNames.size() + 1,
+		  "the shipped config has one block per fix plus server_list_players");
+
+	for (const char* name : config::kFixNames) {
+		const KvNode* block = tree->Find(name);
+		Check(block != nullptr, std::string("the shipped config has the block for ") + name);
+		if (block == nullptr) {
+			continue;
+		}
+		Check(block->Find("enable") != nullptr, std::string(name) + " has an \"enable\" key");
+		const config::FixBlock fix = config::ReadFixBlock(*tree, name);
+		Check(fix.options == block, std::string("ReadFixBlock finds the block of ") + name);
+		const bool shouldBeOn = std::string_view(name) != "cstv_bot_quota" && std::string_view(name) != "jump_spam";
+		Check(fix.enabled == shouldBeOn,
+			  std::string(name) + (shouldBeOn ? " is enabled by default" : " is off by default"));
+	}
+	Check(config::ReadFixBlock(*tree, config::kServerListPlayersBlock).enabled,
+		  "the shipped config enables server_list_players (the plugin logs that it is not ported)");
+	Check(config::ReadFixBlock(*tree, "no_such_fix").options == nullptr,
+		  "ReadFixBlock reports a missing block");
+	Check(!config::ReadFixBlock(*tree, "no_such_fix").enabled, "a missing block is disabled");
+
+	// The documented values of the shipped file.
+	const config::FixBlock slow = config::ReadFixBlock(*tree, "slow_animation");
+	if (slow.options != nullptr) {
+		const config::SlowAnimationOptions options = config::ReadSlowAnimation(*slow.options);
+		Check(options.reloadInterval == 1800.0f, "slow_animation reload_interval is 1800 s in the shipped file");
+		Check(options.watch.maxMapHours == 3.0f, "slow_animation max_map_hours is 3 in the shipped file");
+		Check(options.watch.matchWaitMinutes == 120.0f, "slow_animation match_wait_minutes is 120");
+		Check(options.watch.warnMinutes == 2.0f, "slow_animation warn_minutes is 2");
+	}
+	const config::FixBlock keyvalues = config::ReadFixBlock(*tree, "keyvalues_flood");
+	if (keyvalues.options != nullptr) {
+		const config::KeyValuesFloodOptions options = config::ReadKeyValuesFlood(*keyvalues.options);
+		Check(options.maxBytes == 1500 && options.maxPerSecond == 10 && options.burst == 20 && !options.kick,
+			  "keyvalues_flood keeps its shipped 1500/10/20/kick 0");
+	}
+	const config::FixBlock voice = config::ReadFixBlock(*tree, "voice_flood");
+	if (voice.options != nullptr) {
+		const config::VoiceFloodOptions options = config::ReadVoiceFlood(*voice.options);
+		Check(options.maxPackets == 64 && options.maxBytes == 4096 && options.maxPerSecond == 128 &&
+				  options.cooldown == 5.0f && options.kick && options.kickStrikes == 3,
+			  "voice_flood keeps its shipped 64/4096/128/5/kick 1/3");
+	}
+	const config::FixBlock teamSwitch = config::ReadFixBlock(*tree, "team_switch_spam");
+	if (teamSwitch.options != nullptr) {
+		const config::TeamSwitchSpamOptions options = config::ReadTeamSwitchSpam(*teamSwitch.options);
+		Check(options.maxAttempts == 15 && options.windowSeconds == 10.0,
+			  "team_switch_spam keeps its shipped 15 attempts / 10 s");
+	}
+	const config::FixBlock steamBan = config::ReadFixBlock(*tree, "steam_ban");
+	if (steamBan.options != nullptr) {
+		const config::SteamBanOptions options = config::ReadSteamBan(*steamBan.options);
+		Check(options.clearAfterPass, "steam_ban ships clear_after_pass 1");
+		Check(options.whitelist.empty(), "the shipped steam_ban whitelist is empty");
+	}
+
+	// Missing keys read the built-in defaults the fix classes always had.
+	const KvNode empty;
+	const config::SlowAnimationOptions slowDefaults = config::ReadSlowAnimation(empty);
+	Check(slowDefaults.reloadInterval == 1800.0f && slowDefaults.watch.maxMapHours == 3.0f &&
+			  slowDefaults.watch.matchWaitMinutes == 120.0f && slowDefaults.watch.warnMinutes == 2.0f,
+		  "a missing slow_animation block reads 1800 s / 3 h / 120 min / 2 min");
+	const config::KeyValuesFloodOptions keyvaluesDefaults = config::ReadKeyValuesFlood(empty);
+	Check(keyvaluesDefaults.maxBytes == 1500 && keyvaluesDefaults.maxPerSecond == 10 &&
+			  keyvaluesDefaults.burst == 20 && !keyvaluesDefaults.kick,
+		  "a missing keyvalues_flood block reads 1500/10/20/kick 0");
+	const config::VoiceFloodOptions voiceDefaults = config::ReadVoiceFlood(empty);
+	Check(voiceDefaults.maxPackets == 64 && voiceDefaults.maxBytes == 4096 && voiceDefaults.maxPerSecond == 128 &&
+			  voiceDefaults.cooldown == 5.0f && voiceDefaults.kick && voiceDefaults.kickStrikes == 3,
+		  "a missing voice_flood block reads 64/4096/128/5/kick 1/3");
+	const config::TeamSwitchSpamOptions teamSwitchDefaults = config::ReadTeamSwitchSpam(empty);
+	Check(teamSwitchDefaults.maxAttempts == 15 && teamSwitchDefaults.windowSeconds == 10.0,
+		  "a missing team_switch_spam block reads 15 attempts / 10 s");
+	const config::SteamBanOptions steamBanDefaults = config::ReadSteamBan(empty);
+	Check(steamBanDefaults.clearAfterPass && steamBanDefaults.whitelist.empty(),
+		  "a missing steam_ban block reads clear_after_pass 1 and no whitelist");
+
+	// The floors the fix classes applied are kept (and a NaN never reaches the scheduler).
+	const auto clamped = ParseKv1("\"opt\" { \"reload_interval\" \"1\" \"max_map_hours\" \"0.25\" "
+								  "\"match_wait_minutes\" \"-5\" \"warn_minutes\" \"-6\" }");
+	Check(clamped.has_value(), "the clamp fixture parses");
+	if (clamped) {
+		const config::SlowAnimationOptions options = config::ReadSlowAnimation(*clamped);
+		Check(options.reloadInterval == 60.0f, "reload_interval is floored at 60 s");
+		Check(options.watch.maxMapHours == 1.0f, "max_map_hours in (0, 1) is raised to 1 h");
+		Check(options.watch.matchWaitMinutes == 0.0f && options.watch.warnMinutes == 0.0f,
+			  "negative wait/warn minutes become 0");
+	}
+	const auto clampedKeyValues = ParseKv1("\"kf\" { \"max_bytes\" \"10\" \"max_per_second\" \"0\" "
+										   "\"burst\" \"0\" \"kick\" \"1\" }");
+	if (clampedKeyValues) {
+		const config::KeyValuesFloodOptions options = config::ReadKeyValuesFlood(*clampedKeyValues);
+		Check(options.maxBytes == 256 && options.maxPerSecond == 1 && options.burst == 1 && options.kick,
+			  "keyvalues_flood floors are 256 bytes / 1 per second / burst 1, kick is read");
+	}
+	const auto clampedVoice = ParseKv1("\"vf\" { \"max_packets\" \"1\" \"max_bytes\" \"1\" "
+									   "\"max_per_second\" \"1\" \"cooldown\" \"-3\" \"kick\" \"0\" "
+									   "\"kick_strikes\" \"0\" }");
+	if (clampedVoice) {
+		const config::VoiceFloodOptions options = config::ReadVoiceFlood(*clampedVoice);
+		Check(options.maxPackets == 16 && options.maxBytes == 256 && options.maxPerSecond == 64 &&
+				  options.cooldown == 0.0f && !options.kick && options.kickStrikes == 1,
+			  "voice_flood floors are 16 packets / 256 bytes / 64 per second / cooldown 0 / 1 strike");
+	}
+	const auto clampedTeamSwitch = ParseKv1("\"t\" { \"max_attempts\" \"0\" \"window_seconds\" \"0\" }");
+	if (clampedTeamSwitch) {
+		const config::TeamSwitchSpamOptions options = config::ReadTeamSwitchSpam(*clampedTeamSwitch);
+		Check(options.maxAttempts == 1 && options.windowSeconds == 0.5,
+			  "team_switch_spam floors are 1 attempt / 0.5 s");
+	}
+	const auto whitelist = ParseKv1("\"steam_ban\" { \"clear_after_pass\" \"0\" \"whitelist\" { "
+									"\"Slynx\" \"76561198000000000\" \"bad\" \"nope\" } }");
+	if (whitelist) {
+		const config::SteamBanOptions options = config::ReadSteamBan(*whitelist);
+		Check(!options.clearAfterPass, "clear_after_pass 0 is read");
+		Check(options.whitelist.size() == 2, "every whitelist child is read");
+		if (options.whitelist.size() == 2) {
+			Check(options.whitelist[0].label == "Slynx" &&
+					  options.whitelist[0].steamId64 == "76561198000000000",
+				  "a whitelist entry keeps its label and SteamID64");
+			Check(options.whitelist[1].label == "bad" && options.whitelist[1].steamId64 == "nope",
+				  "a non-SteamID64 entry is read and rejected by the fix (the reader does not filter)");
+		}
+	}
+}
+
+// ---------------------------------------------------------------- paths --------
+
+void TestPaths() {
+	using namespace game_fixes;
+
+	Check(JoinPath("a", "b") == "a/b", "JoinPath joins two fragments");
+	Check(JoinPath("a/", "b") == "a/b", "JoinPath does not double the separator");
+	Check(JoinPath("a", "/b") == "a/b", "JoinPath strips a leading separator of the second part");
+	Check(JoinPath("", "b") == "b", "JoinPath of an empty left side is the right side");
+	Check(JoinPath("a", "") == "a", "JoinPath of an empty right side is the left side");
+
+	const std::vector<std::string> candidates = ConfigCandidates("game_fixes.ini", "/cfg", "/data");
+	Check(candidates.size() == 4, "the config has four lookup candidates");
+	if (candidates.size() == 4) {
+		Check(candidates[0] == "game_fixes.ini", "the bare file name is tried first (working directory)");
+		Check(candidates[1] == "/cfg/game_fixes/game_fixes.ini",
+			  "the packaged <configs>/game_fixes/game_fixes.ini is second");
+		Check(candidates[2] == "/cfg/game_fixes/translations/game_fixes.ini",
+			  "the shim's translations directory is third");
+		Check(candidates[3] == "/data/game_fixes/game_fixes.ini", "the data directory is last");
+	}
+	const std::vector<std::string> relative = ConfigCandidates("game_fixes.ini", "", "");
+	Check(relative.size() == 4 && relative[1] == "game_fixes/game_fixes.ini",
+		  "without host directories the candidates stay relative");
+	Check(ConfigCandidates("", "/cfg", "/data").empty(), "an empty file name has no candidates");
+
+	// ResolveConfigPath: the packaged location is the fallback for the error log, an existing file
+	// wins over it (in either the configs or the data directory).
+	const std::filesystem::path root =
+		std::filesystem::temp_directory_path() / ("game_fixes_paths_tests_" + std::to_string(::getpid()));
+	std::error_code error;
+	std::filesystem::remove_all(root, error);
+	std::filesystem::create_directories(root / "configs" / "game_fixes", error);
+	const std::string configsDir = (root / "configs").string();
+	const std::string dataDir = (root / "data").string();
+
+	const std::string fallback = ResolveConfigPath("game_fixes.ini", configsDir, dataDir);
+	Check(fallback == JoinPath(JoinPath(configsDir, "game_fixes"), "game_fixes.ini"),
+		  "with no file on disk the packaged path is returned (for the log line)");
+
+	const std::string packaged = JoinPath(JoinPath(configsDir, "game_fixes"), "game_fixes.ini");
+	{
+		std::ofstream file(packaged);
+		file << "// placeholder\n";
+	}
+	Check(FileExists(packaged), "the temp config file exists");
+	Check(ResolveConfigPath("game_fixes.ini", configsDir, dataDir) == packaged,
+		  "an existing packaged config is found");
+	Check(ResolveConfigPath(packaged, "/nonexistent", "/nonexistent") == packaged,
+		  "an absolute path that exists is used as given");
+	std::filesystem::remove_all(root, error);
+}
+
+// -------------------------------------------------------------- map gate ------
+
+void TestMapGate() {
+	using game_fixes::MapGate;
+
+	MapGate gate;
+	Check(!gate.Ready() && !gate.BetweenMaps() && !gate.ListenersRegistered(),
+		  "a fresh gate is shut and has no listeners");
+	Check(!gate.OnPluginUpdate(true), "without listeners an update cannot open the gate");
+	Check(!gate.Ready(), "the gate stays shut without listeners");
+
+	gate.SetListenersRegistered(true);
+	Check(!gate.OnPluginUpdate(false), "an update without a map name does not open the gate");
+	Check(!gate.Ready(), "the gate is still shut after an update without a map");
+
+	// A plugin loaded (or reloaded) into a running map never saw OnMapStart: its first update is
+	// the "a map is up" evidence.
+	Check(gate.OnPluginUpdate(true), "the first update with a map name opens the gate (mid-map load)");
+	Check(gate.Ready(), "the gate is open after that update");
+	Check(!gate.OnPluginUpdate(true), "a later update does not report another transition");
+
+	gate.OnMapEnd();
+	Check(!gate.Ready() && gate.BetweenMaps(), "OnMapEnd shuts the gate and marks the map-change window");
+	Check(!gate.OnPluginUpdate(true), "no update re-opens the gate between maps");
+	Check(!gate.Ready(), "the gate stays shut between maps");
+	gate.OnMapStart();
+	Check(!gate.Ready() && !gate.BetweenMaps(), "OnMapStart does not latch readiness itself");
+	Check(gate.OnPluginUpdate(true), "the first update after OnMapStart opens the gate");
+	Check(gate.Ready(), "the gate is open on the new map");
+
+	gate.Close();
+	Check(!gate.Ready(), "Close shuts the gate for unload");
+
+	// A server that never has a map: Start + updates without a map name never open it.
+	MapGate noMap;
+	noMap.SetListenersRegistered(true);
+	noMap.OnMapStart();
+	Check(!noMap.OnPluginUpdate(false), "without a map name the gate never opens");
+	Check(!noMap.Ready(), "a map-less server keeps every client call off");
+
+	// A failed listener registration leaves the gate shut forever (fail closed).
+	MapGate noListeners;
+	noListeners.OnMapStart();
+	Check(!noListeners.OnPluginUpdate(true), "the gate needs registered listeners");
+	Check(!noListeners.Ready(), "the gate stays shut when the listeners could not be registered");
+
+	// Reset (= OnPluginStart / `plg reload`) forgets everything, including a previously open gate.
+	MapGate reloaded;
+	reloaded.SetListenersRegistered(true);
+	reloaded.OnPluginUpdate(true);
+	reloaded.Reset();
+	Check(!reloaded.Ready() && !reloaded.BetweenMaps() && !reloaded.ListenersRegistered(),
+		  "Reset shuts a fresh instance completely");
+}
+
+// ----------------------------------------------------------- schema cache -----
+
+int g_lookupCalls = 0;
+
+std::int32_t FakeSchemaLookup(const char* className, const char* fieldName) {
+	++g_lookupCalls;
+	if (className == nullptr || fieldName == nullptr) {
+		return -1;
+	}
+	if (std::string_view(className) == "Missing") {
+		return -1;
+	}
+	return 123;
+}
+
+void TestSchemaCache() {
+	using game_fixes::SchemaOffsetCache;
+
+	SchemaOffsetCache cache;
+	g_lookupCalls = 0;
+	Check(cache.Offset(false, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == -1,
+		  "a shut map gate answers -1");
+	Check(g_lookupCalls == 0, "a shut map gate never calls the schema lookup");
+	Check(cache.Offset(true, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == 123,
+		  "an open gate resolves the offset");
+	Check(g_lookupCalls == 1, "the lookup ran once");
+	Check(cache.Offset(true, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == 123,
+		  "a cached offset is served again");
+	Check(g_lookupCalls == 1, "a cached hit does not call the lookup again");
+	Check(cache.CachedCount() == 1, "one successful offset is cached");
+	Check(cache.Offset(true, "Missing", "m_X", &FakeSchemaLookup) == -1, "an unknown field answers -1");
+	Check(cache.Offset(true, "Missing", "m_X", &FakeSchemaLookup) == -1, "an unknown field is retried");
+	Check(g_lookupCalls == 3, "a failed lookup is not cached (only < 0 hits stay retryable)");
+	Check(cache.CachedCount() == 1, "a failed lookup does not grow the cache");
+	Check(cache.Offset(true, "", "m_X", &FakeSchemaLookup) == -1, "an empty class name answers -1");
+	Check(cache.Offset(true, "CBaseEntity", "", &FakeSchemaLookup) == -1, "an empty field name answers -1");
+	Check(cache.Offset(true, "CBaseEntity", "m_iHealth", nullptr) == -1, "a missing lookup answers -1");
+	Check(cache.Offset(false, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == -1,
+		  "the shut gate hides even a cached offset");
+	Check(cache.Offset(true, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == 123,
+		  "the offset is still remembered when the gate reopens");
+	Check(g_lookupCalls == 3, "the cached offset survived the shut gate");
+	cache.Clear();
+	Check(cache.CachedCount() == 0, "Clear forgets every offset (OnPluginEnd)");
+	Check(cache.Offset(true, "CBaseEntity", "m_iHealth", &FakeSchemaLookup) == 123 && g_lookupCalls == 4,
+		  "after Clear the field is resolved again");
+}
+
+// ------------------------------------------- scheduler: delayed work, floor ----
+
+void TestSchedulerDelayedWorkAndFloor() {
+	using namespace game_fixes::scheduler;
+
+	// PITFALLS C.9: no delay below one tick reaches a timer, whatever the caller passed.
+	Shutdown();
+	Init();
+	const float minimum = static_cast<float>(kMinTimerInterval);
+	Timer* zero = AddTimer(0.0f, []() {}, kTimerFlagRepeat);
+	Timer* negative = AddTimer(-5.0f, []() {}, kTimerFlagRepeat);
+	Timer* notANumber = AddTimer(std::numeric_limits<float>::quiet_NaN(), []() {}, 0);
+	Check(zero->interval == minimum, "a 0-delay timer is clamped to one 64-tick");
+	Check(negative->interval == minimum, "a negative delay is clamped to one 64-tick");
+	Check(notANumber->interval == minimum, "a NaN delay is clamped to one 64-tick");
+
+	// OnMapEnd drops the per-map delayed work: a deferred kick / the blank_map restart must not run
+	// on the new map, while the periodic checks (repeat timers) keep running.
+	Shutdown();
+	Init();
+	Tick(0.0); // the first tick after Init only arms the clock
+	int onceFires = 0;
+	int repeatFires = 0;
+	int frameFires = 0;
+	AddTimer(0.02f, [&onceFires]() { ++onceFires; }, 0);
+	Timer* repeat = AddTimer(0.02f, [&repeatFires]() { ++repeatFires; }, kTimerFlagRepeat);
+	NextFrame([&frameFires]() { ++frameFires; });
+	ClearDelayedWork();
+	for (int i = 0; i < 20; ++i) {
+		Tick(0.02);
+	}
+	Check(onceFires == 0, "ClearDelayedWork drops one-shot timers (they belong to the old map)");
+	Check(frameFires == 0, "ClearDelayedWork drops queued next-frame work");
+	Check(repeatFires >= 3 && repeatFires <= 5, "ClearDelayedWork keeps repeating timers (they check the map gate)");
+	KillTimer(repeat);
+
+	// The next-frame queue works again after the map end (the new map can schedule its own work).
+	int afterMapEnd = 0;
+	NextFrame([&afterMapEnd]() { ++afterMapEnd; });
+	Tick(0.02);
+	Check(afterMapEnd == 1, "a next-frame task queued after a map end runs");
+
+	Shutdown();
+	Init();
+}
+
 } // namespace
 
 int main() {
@@ -615,9 +1247,24 @@ int main() {
 	TestBanMapNeutralize();
 	TestBanMapRemoveAll();
 	TestScheduler();
+	TestSchedulerDelayedWorkAndFloor();
+	TestKv1();
+	TestConfigReaders();
+	TestPaths();
+	TestMapGate();
+	TestSchemaCache();
 	TestSlowAnimationGhostFilter();
 	TestSlowAnimationConfig();
+	TestSlowAnimationHumanStamp();
 	TestSlowAnimationWatch();
+	TestTeamLimitFields();
+	TestSvCheatsLogic();
+	TestVoiceFixLogic();
+	TestPlayerGhostLogic();
+	TestFakeMessagesLogic();
+	TestBlankMapLogic();
+	TestCstvLogic();
+	TestJumpSpamLogic();
 	TestLoadPolicy();
 	TestEncodedIndex();
 	TestHandleValidity();

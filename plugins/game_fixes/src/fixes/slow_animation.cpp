@@ -30,15 +30,13 @@
 // pattern), every field is read raw at its schema offset and width, and every pointer is
 // validated in the same tick before it is used. The offsets are resolved lazily once a map runs.
 
+#include "../config.hpp"
 #include "../fixes.hpp"
+#include "../map_gate.hpp"
+#include "../output.hpp"
 #include "../scheduler.hpp"
+#include "../schema_cache.hpp"
 #include "../slow_animation_logic.hpp"
-
-#include <pisex/compat.hpp>
-#include <pisex/keyvalues.hpp>
-#include <pisex/output.hpp>
-#include <pisex/schema.hpp>
-#include <pisex/timers.hpp>
 
 #include <cmath>
 #include <cstdarg>
@@ -50,13 +48,37 @@
 namespace game_fixes {
 namespace {
 
+// The engine's current map name, or an empty string while no map is running. Gate-checked: a
+// plugin loaded mid-map asks this only from its first gated update on, and it touches no client.
+std::string CurrentMapName() {
+	if (!IsMapReady() || !__s2sdk_GetCurrentMap) {
+		return {};
+	}
+	try {
+		const plg::string map = s2sdk::GetCurrentMap();
+		return std::string(map.c_str(), map.size());
+	} catch (...) {
+		return {};
+	}
+}
+
+// The schema lookups wait this long after a map start: the watch timer's first fire after a map
+// change is re-armed with one tick, and a lookup made in that window can miss while s2sdk caches
+// the miss. The plugin's own offsets wait the same second for the same reason (plugin.cpp).
+constexpr double kSchemaResolveDelay = 1.0;
+// How many times a partial result is retried (once per watch tick) before it is accepted as
+// missing from the schema. One retry: s2sdk caches a class's field table on the first lookup, so a
+// second miss is almost certainly permanent and each extra attempt would only repeat its
+// "field not found" warnings.
+constexpr int kSchemaResolveAttempts = 2;
+
 class CSlowAnimationFix final : public CFix {
 public:
 	explicit CSlowAnimationFix(Environment& env) : CFix(env) {}
 
 	const char* Name() const override { return "slow_animation"; }
 
-	void ReadConfig(const pisex::KeyValues& config) override;
+	void ReadConfig(const KvNode& config) override;
 	bool Load() override;
 	void Unload() override;
 	void OnStartupServer(const char* mapName) override;
@@ -73,6 +95,8 @@ private:
 
 	PlayerCounts CountPlayers() const;
 
+	// The short human sample: keeps the last-human stamp fresh between the reload_interval checks.
+	void TrackHumans();
 	// The reload_interval check: the diagnostics line, then the empty-server reload.
 	void OnReloadTimer();
 	// The max_map_hours watch: arms the reload, waits for warmup or a new match, and falls back to
@@ -88,7 +112,8 @@ private:
 	// map at all.
 	bool EnsureMapSnapshot();
 	void LogStatus(const char* why);
-	// Prints to every player through the chat (pisexcompat/PrintToChatAll), and logs it.
+	// Prints to every player through the chat (src/output.hpp: a literal line, no language or
+	// phrase call), and logs it.
 	void Announce(const char* format, ...) const;
 
 	// Resolves the schema offsets once a map is up (never at plugin start: GetSchemaOffset walks
@@ -98,6 +123,8 @@ private:
 	void* GetGameRules();
 	slowanim::RulesSnapshot ReadRules();
 	static float CurTime();
+	// The map-gated schema lookup the cache calls (src/schema_cache.hpp).
+	static std::int32_t LookupSchemaOffset(const char* className, const char* fieldName);
 
 	// Seconds between empty-server checks ("reload_interval").
 	float m_reloadInterval = 1800.0f;
@@ -107,10 +134,14 @@ private:
 	slowanim::Watch m_watch;
 
 	scheduler::Timer* m_reloadTimer = nullptr;
-	pisex::CTimer* m_watchTimer = nullptr;
+	// Samples the players every kHumanCheckInterval (see TrackHumans).
+	scheduler::Timer* m_humanTimer = nullptr;
+	scheduler::Timer* m_watchTimer = nullptr;
 
 	uint64_t m_timelimitCvar = 0;
 
+	// The map-gated, success-only offset cache (src/schema_cache.hpp).
+	SchemaOffsetCache m_schemaCache;
 	// Schema offsets (CCSGameRulesProxy::m_pGameRules, the four CCSGameRules fields and
 	// CBasePlayerController::m_iConnected); -1 until resolved, kept -1 when the field is missing.
 	std::int32_t m_offProxyGameRules = -1;
@@ -120,6 +151,9 @@ private:
 	std::int32_t m_offGamePhase = -1;
 	std::int32_t m_offControllerConnected = -1;
 	bool m_offsetsResolved = false;
+	// A partial result is retried on the next watch tick (s2sdk caches a class lookup it made too
+	// early, so the first attempt may miss); bounded, then the missing fields are accepted.
+	int m_offsetAttempts = 0;
 
 	// Map name and universal time from the last StartupServer (or from the game server when the
 	// plugin was loaded mid-map).
@@ -133,15 +167,11 @@ private:
 	float m_pendingTimelimit = -1.0f;
 };
 
-void CSlowAnimationFix::ReadConfig(const pisex::KeyValues& config) {
-	m_reloadInterval = config.GetFloat("reload_interval", 1800.0f);
-	if (m_reloadInterval < 60.0f) {
-		m_reloadInterval = 60.0f; // anything shorter would just keep flipping the map around
-	}
-
-	m_watchConfig = slowanim::ClampConfig(config.GetFloat("max_map_hours", 3.0f),
-										  config.GetFloat("match_wait_minutes", 120.0f),
-										  config.GetFloat("warn_minutes", 2.0f));
+void CSlowAnimationFix::ReadConfig(const KvNode& config) {
+	// The option names, defaults and clamps live in src/config.hpp (pinned by the tests).
+	const config::SlowAnimationOptions options = config::ReadSlowAnimation(config);
+	m_reloadInterval = options.reloadInterval;
+	m_watchConfig = options.watch;
 }
 
 bool CSlowAnimationFix::Load() {
@@ -152,24 +182,27 @@ bool CSlowAnimationFix::Load() {
 	m_timelimitCvar = s2sdk::FindConVar("mp_timelimit");
 	m_reloadTimer = scheduler::AddTimer(m_reloadInterval, [this]() { OnReloadTimer(); },
 										scheduler::kTimerFlagRepeat);
+	// The check above runs every reload_interval; this short one keeps the last-human stamp fresh,
+	// so the kIdleBeforeReload pause is measured from when the server really emptied instead of
+	// from the previous check (which is always older than the pause at the default interval).
+	m_humanTimer = scheduler::AddTimer(static_cast<float>(slowanim::kHumanCheckInterval),
+									   [this]() { TrackHumans(); }, scheduler::kTimerFlagRepeat);
 	LogFix(Name(), Format("checking for an empty server every %.0f s", m_reloadInterval));
 
 	if (m_watchConfig.maxMapHours > 0.0f) {
-		// pisexcompat's timer pump: the delay is floored at one tick, a fire that falls into a map
-		// change is postponed to the first ready frame, and the callback re-validates the map
-		// state below before touching anything.
-		m_watchTimer = pisex::CreateTimer(static_cast<float>(slowanim::kWatchInterval), [this]() -> float {
-			OnWatchTimer();
-			return static_cast<float>(slowanim::kWatchInterval);
-		});
+		// The plugin's own scheduler: AddTimer floors the delay at one tick, the timer survives a
+		// map change but its callback re-validates the map gate before touching anything, and the
+		// map-end listener drops the per-map delayed work (plugin.cpp).
+		m_watchTimer = scheduler::AddTimer(static_cast<float>(slowanim::kWatchInterval),
+										   [this]() { OnWatchTimer(); }, scheduler::kTimerFlagRepeat);
 		if (m_watchTimer) {
 			LogFix(Name(), Format("with players on: once curtime passes %.1f h, reload at the next warmup or "
 								  "new match (or at a round end after %.0f min, warning %.0f min ahead)",
 								  m_watchConfig.maxMapHours, m_watchConfig.matchWaitMinutes,
 								  m_watchConfig.warnMinutes));
 		} else {
-			LogFix(Name(), "max_map_hours is on, but the watch timer could not be created (s2sdk timer "
-						   "bindings are missing) - only the empty-server reload runs",
+			LogFix(Name(), "max_map_hours is on, but the watch timer could not be created - only the "
+						   "empty-server reload runs",
 				   plg::Severity::Warning);
 		}
 	} else {
@@ -181,8 +214,10 @@ bool CSlowAnimationFix::Load() {
 void CSlowAnimationFix::Unload() {
 	scheduler::KillTimer(m_reloadTimer);
 	m_reloadTimer = nullptr;
+	scheduler::KillTimer(m_humanTimer);
+	m_humanTimer = nullptr;
 	if (m_watchTimer) {
-		pisex::RemoveTimer(m_watchTimer);
+		scheduler::KillTimer(m_watchTimer);
 		m_watchTimer = nullptr;
 	}
 }
@@ -212,7 +247,7 @@ void CSlowAnimationFix::OnStartupServer(const char* mapName) {
 	// The map's own cfg runs after StartupServer and would overwrite the value; one frame later is
 	// past that.
 	scheduler::NextFrame([this, pending]() {
-		if (!pisex::IsGameReady()) {
+		if (!IsMapReady()) {
 			return;
 		}
 		LogStatus("new map");
@@ -236,7 +271,7 @@ bool CSlowAnimationFix::EnsureMapSnapshot() {
 	// Loaded mid-map (plugin reload on a running server): no StartupServer to name the map, so ask
 	// the game server. Its map age is unknown, but max_map_hours goes by curtime and does not need
 	// it.
-	const std::string_view map = pisex::CurrentMap();
+	const std::string map = CurrentMapName();
 	if (map.empty()) {
 		return false;
 	}
@@ -253,11 +288,19 @@ bool CSlowAnimationFix::EnsureMapSnapshot() {
 	return true;
 }
 
+void CSlowAnimationFix::TrackHumans() {
+	// CountPlayers() reports a human while no map is ready on purpose (no reload may fire in a
+	// changelevel window); RefreshLastHuman() then leaves the stamp alone.
+	const PlayerCounts players = CountPlayers();
+	m_lastHumanSeen = slowanim::RefreshLastHuman(m_lastHumanSeen, scheduler::UniversalTime(),
+												 IsMapReady(), players.humans);
+}
+
 void CSlowAnimationFix::OnReloadTimer() {
 	// The scheduler keeps wall-clock time through a level change, so this callback can run while
 	// the old entities and globals are being torn down. Do not inspect the client list, globals, or
-	// gamerules until pisexcompat confirms that the new map is live.
-	if (!pisex::IsGameReady()) {
+	// gamerules until the map gate confirms that a new map is live.
+	if (!IsMapReady()) {
 		return;
 	}
 	if (!EnsureMapSnapshot()) {
@@ -285,12 +328,12 @@ void CSlowAnimationFix::OnReloadTimer() {
 		return;
 	}
 
-	// Nobody is on right now, but someone was just here: do not reload until the pause has passed,
-	// or an incoming player lands exactly in a level change. Also protects "join, leave, join".
-	const double idleSeconds = now - m_lastHumanSeen;
-	if (m_lastHumanSeen > 0.0 && idleSeconds < slowanim::kIdleBeforeReload) {
+	// Nobody is on right now, but someone was just here (the short human timer keeps the stamp
+	// close to the real disconnect): do not reload until the pause has passed, or an incoming
+	// player lands exactly in a level change. Also protects "join, leave, join".
+	if (!slowanim::EmptyLongEnough(now, m_lastHumanSeen)) {
 		LogFix(Name(), Format("reload skipped: server idle for %.0f s (waiting for %.0f s), next check in %.0f s",
-							  idleSeconds, slowanim::kIdleBeforeReload, m_reloadInterval));
+							  now - m_lastHumanSeen, slowanim::kIdleBeforeReload, m_reloadInterval));
 		return;
 	}
 
@@ -299,9 +342,13 @@ void CSlowAnimationFix::OnReloadTimer() {
 
 void CSlowAnimationFix::OnWatchTimer() {
 	try {
-		if (m_watchConfig.maxMapHours <= 0.0f || !m_watchTimer || !pisex::IsGameReady()) {
+		if (m_watchConfig.maxMapHours <= 0.0f || !m_watchTimer || !IsMapReady()) {
 			return;
 		}
+		// Before the snapshot, like the original: a plugin loaded into a running map has no m_map
+		// yet, and ResolveSchemaOffsets() keys its delay on the snapshot. Deferring that first
+		// resolve would arm the watch on an empty rules snapshot and then mistake the real one, one
+		// tick later, for a new match - an immediate mid-match reload without the timelimit carried.
 		ResolveSchemaOffsets();
 		if (!EnsureMapSnapshot()) {
 			return;
@@ -433,7 +480,7 @@ CSlowAnimationFix::PlayerCounts CSlowAnimationFix::CountPlayers() const {
 	// No map running (right after load, or during shutdown/changelevel, when the client list is
 	// torn down): report a player instead of touching anything, so no reload can fire in that
 	// window. The next check sees the new map.
-	if (!pisex::IsGameReady()) {
+	if (!IsMapReady()) {
 		counts.humans = 1;
 		return counts;
 	}
@@ -485,16 +532,51 @@ CSlowAnimationFix::PlayerCounts CSlowAnimationFix::CountPlayers() const {
 	return counts;
 }
 
+std::int32_t CSlowAnimationFix::LookupSchemaOffset(const char* className, const char* fieldName) {
+	if (!__s2sdk_GetSchemaOffset) {
+		return -1;
+	}
+	try {
+		return s2sdk::GetSchemaOffset(plg::string(className), plg::string(fieldName));
+	} catch (...) {
+		return -1;
+	}
+}
+
 void CSlowAnimationFix::ResolveSchemaOffsets() {
-	if (m_offsetsResolved || !pisex::IsGameReady()) {
+	if (m_offsetsResolved || !IsMapReady()) {
 		return;
 	}
-	m_offProxyGameRules = pisex::SchemaOffset("CCSGameRulesProxy", "m_pGameRules");
-	m_offWarmup = pisex::SchemaOffset("CCSGameRules", "m_bWarmupPeriod");
-	m_offGameStart = pisex::SchemaOffset("CCSGameRules", "m_flGameStartTime");
-	m_offTotalRounds = pisex::SchemaOffset("CCSGameRules", "m_totalRoundsPlayed");
-	m_offGamePhase = pisex::SchemaOffset("CCSGameRules", "m_gamePhase");
-	m_offControllerConnected = pisex::SchemaOffset("CBasePlayerController", "m_iConnected");
+	// The watch timer's first fire lands right after the map-start window (the gate opens and the
+	// first tick runs in the same update); a lookup made there can come back empty and s2sdk
+	// caches the miss. Wait the same second the plugin's own offsets wait. The clock is the
+	// plugin's pumped one, so "a second" means a second of map frames, not of shutdown time; the
+	// snapshot StartupServer took (not a nonzero stamp - the first map starts at time 0) is what
+	// enables this. A plugin loaded into a running map has no snapshot yet and resolves on its
+	// first tick: there is no map-start window in that case.
+	if (m_map[0] != '\0' && scheduler::UniversalTime() - m_mapStartTime < kSchemaResolveDelay) {
+		return;
+	}
+	// Only successful lookups are memoised and the cache answers -1 while the gate is shut
+	// (src/schema_cache.hpp, pinned by the tests) - the same policy pisex::SchemaOffset had.
+	m_offProxyGameRules =
+		m_schemaCache.Offset(IsMapReady(), "CCSGameRulesProxy", "m_pGameRules", &CSlowAnimationFix::LookupSchemaOffset);
+	m_offWarmup =
+		m_schemaCache.Offset(IsMapReady(), "CCSGameRules", "m_bWarmupPeriod", &CSlowAnimationFix::LookupSchemaOffset);
+	m_offGameStart =
+		m_schemaCache.Offset(IsMapReady(), "CCSGameRules", "m_flGameStartTime", &CSlowAnimationFix::LookupSchemaOffset);
+	m_offTotalRounds = m_schemaCache.Offset(IsMapReady(), "CCSGameRules", "m_totalRoundsPlayed",
+											&CSlowAnimationFix::LookupSchemaOffset);
+	m_offGamePhase =
+		m_schemaCache.Offset(IsMapReady(), "CCSGameRules", "m_gamePhase", &CSlowAnimationFix::LookupSchemaOffset);
+	m_offControllerConnected = m_schemaCache.Offset(IsMapReady(), "CBasePlayerController", "m_iConnected",
+													&CSlowAnimationFix::LookupSchemaOffset);
+
+	const bool complete = m_offProxyGameRules >= 0 && m_offWarmup >= 0 && m_offGameStart >= 0 &&
+						  m_offTotalRounds >= 0 && m_offGamePhase >= 0 && m_offControllerConnected >= 0;
+	if (!complete && ++m_offsetAttempts < kSchemaResolveAttempts) {
+		return; // retry on the next watch tick; a transient miss must not be latched
+	}
 	m_offsetsResolved = true;
 
 	if (m_offWarmup < 0 || m_offGameStart < 0 || m_offTotalRounds < 0 || m_offGamePhase < 0) {
@@ -510,7 +592,7 @@ void CSlowAnimationFix::ResolveSchemaOffsets() {
 }
 
 void* CSlowAnimationFix::GetGameRules() {
-	if (!pisex::IsGameReady()) {
+	if (!IsMapReady()) {
 		return nullptr;
 	}
 
@@ -567,14 +649,22 @@ slowanim::RulesSnapshot CSlowAnimationFix::ReadRules() {
 }
 
 float CSlowAnimationFix::CurTime() {
-	// The snapshot is refreshed at the start of every pisex::Poll(); the watch timer fires from
-	// inside that Poll, and the reload timer runs right after it, so this is the current curtime.
-	return pisex::GetCGlobalVars()->curtime;
+	// s2sdk's GetGameTime reads the same gpGlobals->curtime the shim's snapshot exposed. The
+	// callers are gated already; the gate and the binding are checked here as well, because a
+	// timer callback must never dereference null globals itself.
+	if (!IsMapReady() || !__s2sdk_GetGameTime) {
+		return 0.0f;
+	}
+	try {
+		return s2sdk::GetGameTime();
+	} catch (...) {
+		return 0.0f;
+	}
 }
 
 void CSlowAnimationFix::LogStatus(const char* why) {
-	const pisex::GlobalVars* globals = pisex::GetCGlobalVars();
-	const float curtime = globals->curtime;
+	const float curtime = CurTime();
+	const int tickcount = (IsMapReady() && __s2sdk_GetGameTickCount) ? s2sdk::GetGameTickCount() : 0;
 	// The gap to the next representable float is the step every animation, movement and lag
 	// compensation timestamp is quantised to.
 	const float stepMs =
@@ -593,7 +683,7 @@ void CSlowAnimationFix::LogStatus(const char* why) {
 		   Format("%s: map '%s' for %.1f min, curtime %.1f s (%.2f h, float step %.2f ms), tickcount %d, %s, "
 				  "%d human(s), %d leftover controller(s)%s",
 				  why, m_map, (scheduler::UniversalTime() - m_mapStartTime) / 60.0, curtime, curtime / 3600.0f,
-				  stepMs, globals->tickcount, rulesText, players.humans, players.ghosts,
+				  stepMs, tickcount, rulesText, players.humans, players.ghosts,
 				  m_watch.Pending() ? (m_watch.Fallback() ? ", reload due at a round end" : ", reload due at warmup / a new match")
 									: ""));
 }
@@ -605,7 +695,7 @@ void CSlowAnimationFix::Announce(const char* format, ...) const {
 	std::vsnprintf(message, sizeof(message), format, args);
 	va_end(args);
 
-	pisex::PrintToChatAll("%s", message);
+	PrintToChatAll(message);
 	LogFix(Name(), std::string("announced: ") + message);
 }
 

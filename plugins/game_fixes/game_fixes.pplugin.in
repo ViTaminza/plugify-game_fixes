@@ -17,10 +17,6 @@
 		{
 			"name": "polyhook",
 			"constraints": ">=2.5.6"
-		},
-		{
-			"name": "hudmenu",
-			"optional": true
 		}
 	]
 }

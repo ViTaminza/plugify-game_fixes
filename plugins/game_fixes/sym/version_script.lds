@@ -9,9 +9,5 @@
            from the polyhook plugin's exported methods) */
         __polyhook_*;
 
-        /* hudmenu binding slots: pisexcompat PUBLIC-links hudmenu_bindings, so every consumer
-           exports them (and declares the optional hudmenu dependency) */
-        __hudmenu_*;
-
     local: *;
 };

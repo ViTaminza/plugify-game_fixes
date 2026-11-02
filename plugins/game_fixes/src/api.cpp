@@ -173,6 +173,12 @@ bool Environment::Resolve() {
 	fnCategorizePosition = gamedata.Signature("CCSPlayer_MovementServices_CategorizePosition");
 	fnWaterMove = gamedata.Signature("CCSPlayer_MovementServices_WaterMove");
 	fnCheckSteamBan = gamedata.Signature("GameSystem_Think_CheckSteamBan");
+	fnCheckJumpButtonLegacy = gamedata.Signature("CCSPlayer_MovementServices_CheckJumpButtonLegacy");
+	fnCheckJumpButtonModern = gamedata.Signature("CCSPlayer_MovementServices_CheckJumpButtonModern");
+	fnOnJumpLegacy = gamedata.Signature("CCSPlayer_MovementServices_OnJumpLegacy");
+	fnOnJumpModern = gamedata.Signature("CCSPlayer_MovementServices_OnJumpModern");
+	fnCstvSelectAndKickBot = gamedata.Signature("CstvBotQuotaFix_SelectAndKickBot");
+	fnCstvTeamCandidate = gamedata.Signature("CstvBotQuotaFix_TeamCandidate");
 
 	// lea reg, [rip + sm_mapGcBanInformation]: the operand is the map itself.
 	if (void* ref = gamedata.Signature("CCSGameRules_sm_mapGcBanInformation")) {
@@ -193,10 +199,12 @@ bool Environment::Resolve() {
 	offUserId = gamedata.Offset("CServerSideClientBase_m_UserID", -1);
 	offIsHLTV = gamedata.Offset("CServerSideClientBase_m_bIsHLTV", -1);
 	signonStateConnected = gamedata.Offset("SIGNONSTATE_CONNECTED", -1);
+	signonStateSpawn = gamedata.Offset("SIGNONSTATE_SPAWN", -1);
 	offVoiceDataMessageId = gamedata.Offset("SVC_Messages_svc_VoiceData", 47);
 	offSessionMaxPlayers = gamedata.Offset("GameSessionConfiguration_maxPlayers", -1);
 	offMoveVelocity = gamedata.Offset("CMoveData_m_vecVelocity", -1);
 	offMoveAbsOrigin = gamedata.Offset("CMoveData_m_vecAbsOrigin", -1);
+	offMoveTickCount = gamedata.Offset("CMoveData_m_nTickCount", -1);
 	offVoiceHasBits = gamedata.Offset("CCLCMsg_VoiceData_hasBits", -1);
 	offVoiceAudio = gamedata.Offset("CCLCMsg_VoiceData_audio", -1);
 	offVoicePacketOffsets = gamedata.Offset("CMsgVoiceAudio_packetOffsets", -1);

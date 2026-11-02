@@ -9,17 +9,18 @@
 // touches the tree's structure — it *neutralizes* an entry by overwriting its key (the account
 // id) and reason with 0xFFFFFFFF, which the pass cannot match, and clears the whole map in Post
 // with the fork's own RemoveAll writes (free list rebuild + root/count reset). That keeps the
-// engine's red-black tree consistent whatever happens and is what makes the default
-// configuration (clear_after_pass 1) behave exactly like the original.
+// engine's red-black tree structurally intact and is what makes the default configuration
+// (clear_after_pass 1) behave exactly like the original. With clear_after_pass 0 the rewritten
+// keys stay in the tree and break its ordering invariant until the map is cleared or the process
+// restarts (the fork's RemoveAt would be needed for a real fix); Load() warns about that.
 //
 // Map layout (offsets in assets/gamedata.jsonc) from the fork's own compiled code: node array at
 // map+0x10 (stride 0x38, nodes: key at +0x10, reason at +0x18), allocation count at map+0x08,
 // root at +0x18, element count at +0x1C, free-list head at +0x20, last allocation at +0x24.
 
-#include "../fixes.hpp"
 #include "../ban_map.hpp"
-
-#include <pisex/keyvalues.hpp>
+#include "../config.hpp"
+#include "../fixes.hpp"
 
 #include <cstdlib>
 #include <unordered_set>
@@ -34,20 +35,24 @@ public:
 
 	const char* Name() const override { return "steam_ban"; }
 
-	void ReadConfig(const pisex::KeyValues& config) override {
-		m_clearAfterPass = config.GetBool("clear_after_pass", true);
-
-		const pisex::KeyValues* whitelist = config.FindKey("whitelist");
-		if (!whitelist) {
-			return;
+	void ReadConfig(const KvNode& config) override {
+		// "clear_after_pass" (default 1) and the "whitelist" label/SteamID64 pairs; the defaults
+		// and the node walking live in src/config.hpp (pinned by the tests).
+		const config::SteamBanOptions options = config::ReadSteamBan(config);
+		m_clearAfterPass = options.clearAfterPass;
+		if (!m_clearAfterPass) {
+			LogFix(Name(), "clear_after_pass is off: a stripped entry keeps its slot with a rewritten key, which "
+						   "breaks the ban map's key ordering until the engine clears it or the process restarts "
+						   "- keep clear_after_pass 1 unless that is acceptable",
+				   plg::Severity::Warning);
 		}
-		for (const pisex::KeyValues* entry = whitelist->GetFirstSubKey(); entry; entry = entry->GetNextKey()) {
-			const std::string_view steamId64 = entry->GetStringValue();
-			const std::uint64_t id = std::strtoull(std::string(steamId64).c_str(), nullptr, 10);
+
+		for (const config::SteamBanWhitelistEntry& entry : options.whitelist) {
+			const std::uint64_t id = std::strtoull(entry.steamId64.c_str(), nullptr, 10);
 			// SteamID64 -> account id (the low 32 bits); reject what cannot be a Steam account.
 			if (id < 76561197960265728ull) {
-				LogFix(Name(), Format("ignoring whitelist entry \"%s\" \"%s\": not a SteamID64", entry->GetName(),
-									  std::string(steamId64).c_str()),
+				LogFix(Name(), Format("ignoring whitelist entry \"%s\" \"%s\": not a SteamID64", entry.label.c_str(),
+									  entry.steamId64.c_str()),
 					   plg::Severity::Warning);
 				continue;
 			}

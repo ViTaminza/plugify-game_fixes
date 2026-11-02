@@ -9,11 +9,10 @@
 
 #include "api.hpp"
 
-namespace pisex {
-class KeyValues;
-}
-
 namespace game_fixes {
+
+// The plugin's own KV1 tree (src/kv1.hpp): the fix blocks of game_fixes.ini.
+struct KvNode;
 
 // Movement hooks: ProcessMovement / TryPlayerMove / CategorizePosition / WaterMove are engine
 // functions several fixes want (rampbug needs all but WaterMove, water_jump needs WaterMove and
@@ -82,7 +81,7 @@ public:
 	virtual const char* Name() const = 0;
 
 	// Reads the fix's own options from its ini block (only called when enabled).
-	virtual void ReadConfig(const pisex::KeyValues& config) { (void)config; }
+	virtual void ReadConfig(const KvNode& config) { (void)config; }
 
 	// Installs the fix; on failure logs why and returns false (the plugin keeps loading).
 	virtual bool Load() = 0;
@@ -94,6 +93,13 @@ public:
 	// OnStartupServer hands every fix the new map name for its per-map resets.
 	virtual void OnStartupServerConfig(void* config) { (void)config; }
 	virtual void OnStartupServer(const char* mapName) { (void)mapName; }
+
+	// Forwarded from the plugin's OnMapEnd listener. A fix drops its per-map delayed work here: a
+	// one-shot timer (workshop_voice's registry lookup) and per-map state (cstv_bot_quota's
+	// selection depth). State only - the client list is already being torn down, so this must not
+	// touch a client, an entity or the schema (PITFALLS B2). The plugin sweeps whatever one-shot
+	// work is left right after this (scheduler::ClearDelayedWork).
+	virtual void OnMapEnd() {}
 
 protected:
 	Environment& m_env;
@@ -114,5 +120,11 @@ std::unique_ptr<CFix> MakeWaterJumpFix(Environment& env);
 std::unique_ptr<CFix> MakeKeyValuesFloodFix(Environment& env);
 std::unique_ptr<CFix> MakeTeamSwitchSpamFix(Environment& env);
 std::unique_ptr<CFix> MakeVoiceFloodFix(Environment& env);
+std::unique_ptr<CFix> MakeVoiceFix(Environment& env);
+std::unique_ptr<CFix> MakePlayerGhostFix(Environment& env);
+std::unique_ptr<CFix> MakeFakeMessagesFix(Environment& env);
+std::unique_ptr<CFix> MakeBlankMapFix(Environment& env);
+std::unique_ptr<CFix> MakeCstvBotQuotaFix(Environment& env);
+std::unique_ptr<CFix> MakeJumpSpamFix(Environment& env);
 
 } // namespace game_fixes

@@ -90,9 +90,13 @@ inline void SetU32At(std::uint8_t* base, std::int32_t offset, std::uint32_t valu
 
 // Neutralizes the whitelisted accounts and, when the cvar is below 2, the competitive-cooldown
 // entries: the pass matches on the key and acts on the reason, so both are overwritten and the
-// entry can no longer kick anybody. The tree itself is never touched (the fork removed entries
-// with RemoveAt; neutralizing keeps the structure consistent no matter what). Returns the number
-// of entries neutralized.
+// entry can no longer kick anybody. The links are never touched, so the tree stays structurally
+// walkable, but a rewritten key no longer satisfies the ordering against its neighbours. That is
+// harmless while the map is cleared after every pass (clear_after_pass 1, the shipped default);
+// with 0 the rewritten keys stay in the tree and a later engine insert/find for a real ban can
+// take a wrong path. Proper removal needs the RB-tree delete (CUtlRBTree::RemoveAt) the fork
+// used - see the warning steam_ban logs when clear_after_pass is off. Returns the number of
+// entries neutralized.
 inline int Neutralize(void* map, const Layout& layout, const std::unordered_set<std::uint32_t>& whitelist,
 					  bool dropCooldowns) {
 	if (!map || !layout.Valid()) {

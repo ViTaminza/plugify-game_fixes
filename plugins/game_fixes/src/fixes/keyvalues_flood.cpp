@@ -8,11 +8,10 @@
 // accessor does (see voice_flood.cpp for the untag/follow/length-before-data read); the field
 // offset is in assets/gamedata.jsonc.
 
+#include "../config.hpp"
 #include "../fixes.hpp"
+#include "../map_gate.hpp"
 #include "../scheduler.hpp"
-
-#include <pisex/compat.hpp>
-#include <pisex/keyvalues.hpp>
 
 namespace game_fixes {
 namespace {
@@ -38,16 +37,13 @@ public:
 
 	const char* Name() const override { return "keyvalues_flood"; }
 
-	void ReadConfig(const pisex::KeyValues& config) override {
-		m_maxBytes = config.GetInt("max_bytes", 1500);
-		m_perSecond = config.GetInt("max_per_second", 10);
-		m_burst = config.GetInt("burst", 20);
-		m_kick = config.GetBool("kick", false);
-		// Below these a normal client would start getting cut: the engine only sends userinfo
-		// keyvalues, a handful of small ones per connect.
-		if (m_maxBytes < 256) m_maxBytes = 256;
-		if (m_perSecond < 1) m_perSecond = 1;
-		if (m_burst < 1) m_burst = 1;
+	void ReadConfig(const KvNode& config) override {
+		// The option names, defaults and floors live in src/config.hpp (pinned by the tests).
+		const config::KeyValuesFloodOptions options = config::ReadKeyValuesFlood(config);
+		m_maxBytes = options.maxBytes;
+		m_perSecond = options.maxPerSecond;
+		m_burst = options.burst;
+		m_kick = options.kick;
 	}
 
 	bool Load() override;
@@ -160,13 +156,13 @@ void CKeyValuesFloodFix::Refuse(void* client, ClientState& state, const char* re
 	// The name/steam id are PlayerManager lookups; during shutdown they walk the emptied client
 	// list (s2sdk does not validate that).
 	std::string who = "(unknown)";
-	if (__s2sdk_GetClientName && pisex::IsGameReady()) {
+	if (__s2sdk_GetClientName && IsMapReady()) {
 		try {
 			who = std::string(std::string_view(s2sdk::GetClientName(slot)));
 		} catch (...) {
 		}
 	}
-	const auto steamId = (__s2sdk_GetClientSteamID64 && pisex::IsGameReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
+	const auto steamId = (__s2sdk_GetClientSteamID64 && IsMapReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
 	LogFix(Name(), Format("%s (slot %d, %llu): %s%s", who.c_str(), slot, static_cast<unsigned long long>(steamId),
 						  reason, m_kick ? ", kicking" : ", dropping their keyvalues"));
 
@@ -182,7 +178,7 @@ void CKeyValuesFloodFix::Refuse(void* client, ClientState& state, const char* re
 			return;
 		}
 		// Map shutdown/changelevel empties the client list; the s2sdk kick path does not check.
-		if (!pisex::IsGameReady()) {
+		if (!IsMapReady()) {
 			return;
 		}
 		void* current = s2sdk::PlayerSlotToClientPtr(slot);

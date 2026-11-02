@@ -1,16 +1,31 @@
-// game_fixes — the plugin core: reads game_fixes.ini, resolves the gamedata (signatures, vtable
-// and structure offsets, and applies the hammer_id byte patch through s2sdk's game config),
-// installs the shared engine hooks and the per-fix ones, and pumps the timers/next-frame queue
-// from OnPluginUpdate.
+// game_fixes — the plugin core: reads game_fixes.ini (through the plugin's own KV1 reader and path
+// resolution), resolves the gamedata (signatures, vtable and structure offsets, and applies the
+// hammer_id byte patch through s2sdk's game config), installs the shared engine hooks and the
+// per-fix ones, and pumps the timers/next-frame queue from OnPluginUpdate.
 //
 // The shared hooks are the ones several fixes want:
 //   * INetworkServerService::StartupServer (Pre) — session configuration + per-map state resets,
 //   * the four CCSPlayer_MovementServices functions — one detour each, dispatched to every
 //     movement listener (rampbug and water_jump overlap on CategorizePosition).
 // Everything that fails to resolve is logged and left off; the plugin itself always loads.
+//
+// The plugin is pure s2sdk (docs/PLUGIN_STANDARD.md §7): pisexcompat is gone, and the few things it
+// provided live in this plugin now —
+//   * the map gate (src/map_gate.hpp): the OnMapStart/OnMapEnd listeners are registered here, the
+//     gate is latched open on the first OnPluginUpdate after a map starts (or after a mid-map
+//     plugin load) and shut on OnMapEnd. No client, entity or schema call runs while it is shut
+//     (PITFALLS B1/B2); this replaces pisex::IsGameReady()/RegisterMapEndCallback/Poll;
+//   * the config reader (src/kv1.hpp) and the path resolution (src/paths.hpp) replace
+//     pisex::KeyValues and pisex::ResolvePath;
+//   * the timer/next-frame pump is this plugin's own scheduler (src/scheduler.cpp), pumped from
+//     OnPluginUpdate; on OnMapEnd the per-map delayed work is dropped (scheduler::ClearDelayedWork)
+//     so a deferred kick or restart meant for the old map can never run against the new one;
+//   * chat output goes through src/output.hpp (a literal message to every player, no language or
+//     phrase call - the server language is never switched).
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,13 +37,13 @@
 #include <polyhook/polyhook.hpp>
 #include <s2sdk/s2sdk.hpp>
 
-#include <pisex/compat.hpp>
-#include <pisex/keyvalues.hpp>
-#include <pisex/paths.hpp>
-
 #include "api.hpp"
+#include "config.hpp"
 #include "fixes.hpp"
+#include "kv1.hpp"
 #include "load_policy.hpp"
+#include "map_gate.hpp"
+#include "paths.hpp"
 #include "scheduler.hpp"
 
 namespace game_fixes {
@@ -48,6 +63,46 @@ enum MovementSlot : int {
 // How often the schema offsets are retried before the waiting fixes are told to give up (one
 // attempt per second).
 constexpr int kSchemaAttemptsBeforeGivingUp = 60;
+
+// The host's config/data roots. Both are optional bindings; an empty string makes the path helpers
+// fall back to their relative candidates.
+std::string ConfigsDir() {
+	try {
+		if (plg::GetConfigsDir) {
+			const plg::string value = plg::GetConfigsDir();
+			return std::string(value.c_str(), value.size());
+		}
+	} catch (...) {
+	}
+	return {};
+}
+
+std::string DataDir() {
+	try {
+		if (plg::GetDataDir) {
+			const plg::string value = plg::GetDataDir();
+			return std::string(value.c_str(), value.size());
+		}
+	} catch (...) {
+	}
+	return {};
+}
+
+// PITFALLS B1/B3: the one s2sdk call that is safe before the first map. GetCurrentMap null-checks
+// gpGlobals itself and answers an empty string then, which is exactly the proof the map gate needs
+// before it may open.
+bool HasMapName() {
+	if (!__s2sdk_GetCurrentMap) {
+		return false;
+	}
+	try {
+		return !s2sdk::GetCurrentMap().empty();
+	} catch (...) {
+		return false;
+	}
+}
+
+// --- map lifecycle listeners (PITFALLS B1/B2) ----------------------------------------------
 
 class GameFixesPlugin final : public plg::Plugin {
 public:
@@ -81,8 +136,19 @@ private:
 											 int32_t count, polyhook::ReturnHandle ret,
 											 polyhook::CallbackType type);
 
+	// OnMapStart runs when the new map exists, but readiness is latched by the first
+	// OnPluginUpdate (docs/PLUGIN_STANDARD.md §7 item 2), never from inside the map-start callback
+	// chain. OnMapEnd only drops state: the client list is already being torn down, so no client,
+	// entity or schema call may run here (PITFALLS B2). Every fix is told first (it drops its own
+	// per-map timer/latch), then the plugin's scheduler sweeps the remaining delayed work - a
+	// next-frame kick or the blank_map restart belongs to the map that just ended.
+	static void OnMapStartListener();
+	static void OnMapEndListener();
+
 	bool LoadConfig();
 	void LoadPendingSchemaFixes();
+	bool RegisterMapListeners();
+	void UnregisterMapListeners();
 	bool InstallStartupServerHook();
 	bool InstallMovementHooks();
 	void UninstallHooks();
@@ -98,22 +164,42 @@ private:
 	// on is recomputed from m_env on teardown
 	hook::HookRef m_movementHooks[kMovementCount];
 	bool m_movementHooked = false;
-	// True between a map start (our StartupServer Pre callback) and the map-end callback. The
-	// schema system may only be asked while a server is up - its cache walks the entity network
-	// serializer info, which does not exist before the first server start and is torn down again
-	// on shutdown/changelevel (that is what segfaulted inside CollectSchemaFields).
-	bool m_mapRunning = false;
+	// The s2sdk OnMapStart/OnMapEnd listeners are registered (they drive the map gate).
+	bool m_mapListeners = false;
 	bool m_schemaResolved = false;
 	// Set once the retries are exhausted: the lookup caches its misses inside s2sdk and logs one
 	// warning per miss, so it must not be retried forever.
 	bool m_schemaGaveUp = false;
 	int m_schemaAttempts = 0;
 	// pump bookkeeping: OnPluginUpdate carries the frame delta, but the harness only reports
-	// milliseconds since the last call, so a huge gap (server hitching) is clamped.
+	// milliseconds since the last call, so a huge gap (server hitching) is clamped by the check.
 	std::chrono::milliseconds m_sinceSchemaCheck{0};
 };
 
 GameFixesPlugin* GameFixesPlugin::s_instance = nullptr;
+
+// --------------------------------------------------------- map lifecycle --------
+
+void GameFixesPlugin::OnMapStartListener() {
+	try {
+		Gate().OnMapStart();
+	} catch (...) {
+	}
+}
+
+void GameFixesPlugin::OnMapEndListener() {
+	try {
+		Gate().OnMapEnd();
+		if (auto* plugin = s_instance) {
+			for (auto& fix : plugin->m_fixes) {
+				fix->OnMapEnd();
+			}
+		}
+		// The final sweep: queued next-frame tasks and any one-shot timer a fix did not drop.
+		scheduler::ClearDelayedWork();
+	} catch (...) {
+	}
+}
 
 // ---------------------------------------------------------------- hooks --------
 
@@ -124,7 +210,6 @@ polyhook::ResultType GameFixesPlugin::StartupServerPre(polyhook::HookHandle, pol
 		if (!plugin) {
 			return polyhook::ResultType::Ignored;
 		}
-		plugin->m_mapRunning = true;
 		void* config = polyhook::GetArgumentPointer(params, 1);
 		const auto* mapName = static_cast<const char*>(polyhook::GetArgumentPointer(params, 3));
 		for (auto& fix : plugin->m_fixes) {
@@ -271,15 +356,14 @@ polyhook::ResultType GameFixesPlugin::WaterMovePre(polyhook::HookHandle, polyhoo
 // -------------------------------------------------------------- plugin ---------
 
 bool GameFixesPlugin::LoadConfig() {
-	const std::string path = pisex::ResolvePath("game_fixes.ini");
+	const std::string path = ResolveConfigPath(config::kFileName, ConfigsDir(), DataDir());
 	if (path.empty()) {
-		LogFix(kPluginName, "game_fixes.ini not found (looked next to the server and in the configs dir); "
-							"every fix stays off",
+		LogFix(kPluginName, "game_fixes.ini path could not be resolved; every fix stays off",
 			   plg::Severity::Error);
 		return false;
 	}
-	pisex::KeyValues::AutoDelete config(kPluginName);
-	if (!config->LoadFromFile(path)) {
+	const std::optional<KvNode> tree = LoadKv1File(path);
+	if (!tree) {
 		LogFix(kPluginName, "game_fixes.ini could not be parsed (" + path + "); every fix stays off",
 			   plg::Severity::Error);
 		return false;
@@ -291,6 +375,7 @@ bool GameFixesPlugin::LoadConfig() {
 	m_fixes.push_back(MakeHammerIdFix(m_env));
 	m_fixes.push_back(MakeSlowAnimationFix(m_env));
 	m_fixes.push_back(MakeWorkshopVoiceFix(m_env));
+	m_fixes.push_back(MakeVoiceFix(m_env));
 	m_fixes.push_back(MakeSteamBanFix(m_env));
 	m_fixes.push_back(MakeTeamLimitFix(m_env));
 	m_fixes.push_back(MakeInputActivatorCrashFix(m_env));
@@ -300,29 +385,54 @@ bool GameFixesPlugin::LoadConfig() {
 	m_fixes.push_back(MakeKeyValuesFloodFix(m_env));
 	m_fixes.push_back(MakeTeamSwitchSpamFix(m_env));
 	m_fixes.push_back(MakeVoiceFloodFix(m_env));
+	m_fixes.push_back(MakeBlankMapFix(m_env));
+	m_fixes.push_back(MakePlayerGhostFix(m_env));
+	m_fixes.push_back(MakeFakeMessagesFix(m_env));
+	m_fixes.push_back(MakeCstvBotQuotaFix(m_env));
+	m_fixes.push_back(MakeJumpSpamFix(m_env));
+
+	// The factory names must be the ones the shipped config (and src/config.hpp's list) uses: a
+	// mismatch would silently disable a fix, because its block would never be found.
+	for (const auto& fix : m_fixes) {
+		bool known = false;
+		for (const char* name : config::kFixNames) {
+			if (std::string_view(name) == fix->Name()) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
+			LogFix(fix->Name(), "is not in the plugin's fix list; its config block would never be found",
+				   plg::Severity::Error);
+		}
+	}
 
 	std::vector<std::unique_ptr<CFix>> loaded;
 	for (auto& fix : m_fixes) {
-		const pisex::KeyValues* block = config->FindKey(fix->Name());
-		const bool enabled = block != nullptr && block->GetBool("enable");
+		const config::FixBlock block = config::ReadFixBlock(*tree, fix->Name());
+		if (block.options == nullptr) {
+			// A block that is missing, or that only carries "enable", has no options to read.
+			LogFix(fix->Name(), "disabled");
+			continue;
+		}
 		// A fix that needs the schema must not even call into it here: s2sdk's schema cache walks
 		// the entity network serializer info, which only exists once the server is up (a
 		// GetSchemaOffset at plugin start segfaults inside CollectSchemaFields). Such a fix is put
 		// aside *before* Load() and loaded from OnPluginUpdate when the offsets resolve
 		// (src/load_policy.hpp, tested in tests/core_logic_tests.cpp).
-		switch (DecideLoad(enabled, fix->NeedsSchema(), m_schemaResolved)) {
+		switch (DecideLoad(block.enabled, fix->NeedsSchema(), m_schemaResolved)) {
 		case LoadDecision::Skip:
 			LogFix(fix->Name(), "disabled");
 			continue;
 		case LoadDecision::DeferSchema:
-			fix->ReadConfig(*block);
+			fix->ReadConfig(*block.options);
 			LogFix(fix->Name(), "waiting for the schema offsets (loaded on the first update after a map starts)");
 			m_pendingSchema.push_back(std::move(fix));
 			continue;
 		case LoadDecision::Load:
 			break;
 		}
-		fix->ReadConfig(*block);
+		fix->ReadConfig(*block.options);
 		if (!fix->Load()) {
 			LogFix(fix->Name(), "NOT loaded", plg::Severity::Warning);
 			fix->Unload();
@@ -339,7 +449,9 @@ bool GameFixesPlugin::LoadConfig() {
 	// The fork's server_list_players has no counterpart here on purpose: s2sdk's player manager
 	// already pushes the player list to the Steam game server API on its own fixed 5 s interval,
 	// so porting the block (and its update_interval) would fight over the call.
-	if (const pisex::KeyValues* block = config->FindKey("server_list_players"); block && block->GetBool("enable")) {
+	const config::FixBlock notPorted =
+		config::ReadFixBlock(*tree, config::kServerListPlayersBlock);
+	if (notPorted.enabled) {
 		LogFix("server_list_players",
 			   "not ported: s2sdk already pushes the player list to Steam every 5 s (interval not configurable here)");
 	}
@@ -364,6 +476,60 @@ void GameFixesPlugin::LoadPendingSchemaFixes() {
 	}
 	if (!pending.empty() && !m_movementHooked) {
 		InstallMovementHooks();
+	}
+}
+
+bool GameFixesPlugin::RegisterMapListeners() {
+	if (!__s2sdk_OnMapStart_Register || !__s2sdk_OnMapStart_Unregister || !__s2sdk_OnMapEnd_Register ||
+		!__s2sdk_OnMapEnd_Unregister) {
+		LogFix(kPluginName, "the s2sdk map-start/map-end listeners are unavailable; nothing that needs a map is touched",
+			   plg::Severity::Warning);
+		return false;
+	}
+	try {
+		// OnMapEnd first: when the second registration fails, the half-registered pair can only
+		// ever close the gate, never leave it open (the same order plugins/PlayersInfo uses).
+		s2sdk::OnMapEnd_Register(&GameFixesPlugin::OnMapEndListener);
+		s2sdk::OnMapStart_Register(&GameFixesPlugin::OnMapStartListener);
+		m_mapListeners = true;
+		Gate().SetListenersRegistered(true);
+	} catch (...) {
+		// A half-registered pair must leave nothing behind that could call into this library; both
+		// unregisters are safe no-ops when the listener is not registered (PITFALLS A.7).
+		m_mapListeners = false;
+		Gate().SetListenersRegistered(false);
+		try {
+			s2sdk::OnMapStart_Unregister(&GameFixesPlugin::OnMapStartListener);
+		} catch (...) {
+		}
+		try {
+			s2sdk::OnMapEnd_Unregister(&GameFixesPlugin::OnMapEndListener);
+		} catch (...) {
+		}
+	}
+	if (!m_mapListeners) {
+		LogFix(kPluginName, "registering the map-start/map-end listeners failed; nothing that needs a map is touched",
+			   plg::Severity::Warning);
+	}
+	return m_mapListeners;
+}
+
+void GameFixesPlugin::UnregisterMapListeners() {
+	m_mapListeners = false;
+	Gate().SetListenersRegistered(false);
+	// Symmetric teardown (PITFALLS A.7): both listeners are removed even when the plugin is
+	// reloaded, so no callback points into this library after it unloads.
+	if (__s2sdk_OnMapStart_Unregister) {
+		try {
+			s2sdk::OnMapStart_Unregister(&GameFixesPlugin::OnMapStartListener);
+		} catch (...) {
+		}
+	}
+	if (__s2sdk_OnMapEnd_Unregister) {
+		try {
+			s2sdk::OnMapEnd_Unregister(&GameFixesPlugin::OnMapEndListener);
+		} catch (...) {
+		}
 	}
 }
 
@@ -427,7 +593,8 @@ void GameFixesPlugin::UninstallHooks() {
 	// Every recorded hook is dropped independently: a partial install (one detour failed) must
 	// still take the installed ones down, or they would keep callbacks pointing into this library
 	// after it unloads. Unhooking only happens for hooks this plugin created and that no one else
-	// has attached to.
+	// has attached to (PITFALLS D.3: remove the callback first, then unhook by target only when
+	// AreCallbacksRegistered() answers false - a shared hook belongs to its other users).
 	void* addresses[kMovementCount] = {m_env.fnProcessMovement, m_env.fnTryPlayerMove, m_env.fnCategorizePosition,
 									   m_env.fnWaterMove};
 	hook::CallbackHandler pres[kMovementCount] = {&GameFixesPlugin::ProcessMovementPre,
@@ -456,16 +623,21 @@ plg::PluginResult GameFixesPlugin::OnPluginStart() {
 		// The plugin clock starts at 0; the first pump tick only establishes a baseline (the
 		// host's first delta may cover its uptime, which used to fire every timer at boot).
 		scheduler::Init();
-		pisex::Init(kPluginName);
+		// PITFALLS B1/B2: a fresh start (including `plg reload`) begins with the gate shut; the
+		// listeners are registered before anything can run, so the mid-map latch of the first
+		// update is armed from the first frame on.
+		Gate().Reset();
+		RegisterMapListeners();
+		if (!HasMapName()) {
+			LogFix(kPluginName, "no map name yet (or the GetCurrentMap binding is missing); the plugin waits for "
+								"the first map before touching clients, entities or the schema");
+		}
 		if (!m_env.Resolve()) {
 			// Without the gamedata nothing can be installed; the plugin still loads (returning
 			// Failed would stop every other plugify plugin).
 			LogFix(kPluginName, "gamedata could not be resolved; every fix stays off", plg::Severity::Error);
 			return {};
 		}
-		// pisexcompat's map-end callback is driven by s2sdk's own map-end listener and touches no
-		// client (it is registered here, before anything can run).
-		pisex::RegisterMapEndCallback([this]() { m_mapRunning = false; });
 		if (!LoadConfig()) {
 			LogFix(kPluginName, "loaded, but no fix is active (see the config error above)", plg::Severity::Error);
 			return {};
@@ -483,16 +655,20 @@ plg::PluginResult GameFixesPlugin::OnPluginStart() {
 
 plg::PluginResult GameFixesPlugin::OnPluginUpdate(std::chrono::milliseconds dt) {
 	try {
+		// PITFALLS B1/B2: latch the map gate. The first update after OnMapStart (or the first one
+		// of a plugin loaded into a running map) is the "a map is up" evidence, and OnMapEnd
+		// closes the gate again. The latch runs before any fix callback can fire from this pump;
+		// once the gate is open the map-name query is not repeated (it only feeds the latch).
+		if (!Gate().Ready()) {
+			Gate().OnPluginUpdate(HasMapName());
+		}
+
 		// The schema offsets need the schema system, which walks the entity network serializer
 		// info - it only exists while a map runs (querying it earlier segfaults inside
 		// CollectSchemaFields, and it is torn down again during a changelevel). Retry once a
 		// second while a map is up; the fixes waiting for the offsets load on the attempt that
 		// resolves them.
-		// Server-up evidence: our own StartupServer callback, or pisexcompat's map-running state
-		// (true from the first pump on, cleared at map end) - the latter covers a plugin load that
-		// happened after the current map had already started.
-		const bool mapRunning = m_mapRunning || pisex::IsGameReady();
-		if (!m_schemaResolved && !m_schemaGaveUp && mapRunning) {
+		if (!m_schemaResolved && !m_schemaGaveUp && IsMapReady()) {
 			m_sinceSchemaCheck += dt;
 			if (m_sinceSchemaCheck >= std::chrono::seconds(1)) {
 				m_sinceSchemaCheck = std::chrono::milliseconds(0);
@@ -512,10 +688,6 @@ plg::PluginResult GameFixesPlugin::OnPluginUpdate(std::chrono::milliseconds dt) 
 			}
 		}
 
-		// pisexcompat's own pump (deferred startup callbacks, its timer/next-frame queues); this
-		// plugin drives its own scheduler but keeps the library in step like every other consumer.
-		pisex::Poll();
-
 		const double delta = std::chrono::duration<double>(dt).count();
 		scheduler::Tick(delta > 0.0 ? delta : 0.015);
 	} catch (const std::exception& ex) {
@@ -528,15 +700,24 @@ plg::PluginResult GameFixesPlugin::OnPluginUpdate(std::chrono::milliseconds dt) 
 
 plg::PluginResult GameFixesPlugin::OnPluginEnd() {
 	try {
-		for (auto& fix : m_fixes) {
-			fix->Unload();
+		// Reverse load order: a hook that two fixes share (voice_fix creates ProcessVoiceData,
+		// voice_flood loaded later reuses it) is unhooked by its creator once the later-loaded user
+		// has removed its callback. In load order the creator gives up on the still-shared hook and
+		// loses its `created` flag, leaving a callback-less detour behind after `plg reload`
+		// (PITFALLS A.7).
+		for (auto it = m_fixes.rbegin(); it != m_fixes.rend(); ++it) {
+			(*it)->Unload();
 		}
 		m_fixes.clear();
+		m_pendingSchema.clear();
 		m_movement.clear();
 		UninstallHooks();
+		// Symmetric teardown of the map listeners (PITFALLS A.7): registered in OnPluginStart,
+		// removed here, so `plg reload` leaves no callback pointing into this library.
+		UnregisterMapListeners();
+		Gate().Close();
 		m_env.gamedata.Close(); // the fixes and hooks are gone; nothing reads the config anymore
 		scheduler::Shutdown();
-		pisex::Shutdown();
 		s_instance = nullptr;
 	} catch (...) {
 	}

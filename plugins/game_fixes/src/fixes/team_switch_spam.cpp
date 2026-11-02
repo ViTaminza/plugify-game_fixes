@@ -6,17 +6,16 @@
 // protobuf message would need the message ABI, while s2sdk's command manager sees the dispatch of
 // every client command. jointeam/spectate are NOT ConCommands in CS2 (the engine parses them in
 // its ClientCommand path), so they are hooked through the GLOBAL command listener (empty name,
-// filtered by name here) - the same mechanism pisexcompat uses for its game commands: a named
+// filtered by name here) - the same mechanism the old port used for its game commands: a named
 // AddConsoleCommand would shadow the engine's command (the client then gets "not marked
 // FCVAR_CLIENT_CAN_EXECUTE") and a named hook could not be re-created after `plg reload` because
 // the name stays taken. Unrecognized command spam — which the engine's own command rate limiter
 // already covers — is the one case the fork saw and this port does not.
 
+#include "../config.hpp"
 #include "../fixes.hpp"
+#include "../map_gate.hpp"
 #include "../scheduler.hpp"
-
-#include <pisex/compat.hpp>
-#include <pisex/keyvalues.hpp>
 
 namespace game_fixes {
 namespace {
@@ -34,11 +33,11 @@ public:
 
 	const char* Name() const override { return "team_switch_spam"; }
 
-	void ReadConfig(const pisex::KeyValues& config) override {
-		m_maxAttempts = config.GetInt("max_attempts", 15);
-		m_windowSeconds = static_cast<double>(config.GetFloat("window_seconds", 10.0f));
-		if (m_maxAttempts < 1) m_maxAttempts = 1;
-		if (m_windowSeconds < 0.5) m_windowSeconds = 0.5;
+	void ReadConfig(const KvNode& config) override {
+		// The option names, defaults and floors live in src/config.hpp (pinned by the tests).
+		const config::TeamSwitchSpamOptions options = config::ReadTeamSwitchSpam(config);
+		m_maxAttempts = options.maxAttempts;
+		m_windowSeconds = options.windowSeconds;
 	}
 
 	bool Load() override;
@@ -72,7 +71,9 @@ s2sdk::ResultType CTeamSwitchSpamFix::OnGameCommand(int32_t caller, s2sdk::ConCo
 													const plg::vector<plg::string>& args) {
 	try {
 		auto* fix = s_instance;
-		if (fix && caller >= 0 && !args.empty() && __s2sdk_PlayerSlotToClientPtr) {
+		// The map gate covers the client-list lookup below (PITFALLS B2: that list is emptied
+		// between OnMapEnd and the next OnMapStart, and s2sdk does not check it).
+		if (fix && IsMapReady() && caller >= 0 && !args.empty() && __s2sdk_PlayerSlotToClientPtr) {
 			const std::string_view name(args[0].c_str());
 			if (IsRateLimitedCommand(name)) {
 				fix->Count(s2sdk::PlayerSlotToClientPtr(caller));
@@ -119,13 +120,13 @@ void CTeamSwitchSpamFix::Refuse(void* client, ClientState& state) {
 	// The name/steam id are PlayerManager lookups; during shutdown they walk the emptied client
 	// list (s2sdk does not validate that).
 	std::string who = "(unknown)";
-	if (__s2sdk_GetClientName && pisex::IsGameReady()) {
+	if (__s2sdk_GetClientName && IsMapReady()) {
 		try {
 			who = std::string(std::string_view(s2sdk::GetClientName(slot)));
 		} catch (...) {
 		}
 	}
-	const auto steamId = (__s2sdk_GetClientSteamID64 && pisex::IsGameReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
+	const auto steamId = (__s2sdk_GetClientSteamID64 && IsMapReady()) ? s2sdk::GetClientSteamID64(slot) : 0;
 	LogFix(Name(), Format("%s (slot %d, %llu): more than %d team commands in %.1fs, kicking", who.c_str(), slot,
 						  static_cast<unsigned long long>(steamId), m_maxAttempts, m_windowSeconds));
 
@@ -142,7 +143,7 @@ void CTeamSwitchSpamFix::Refuse(void* client, ClientState& state) {
 			return;
 		}
 		// Map shutdown/changelevel empties the client list; the s2sdk kick path does not check.
-		if (!pisex::IsGameReady()) {
+		if (!IsMapReady()) {
 			return;
 		}
 		void* current = s2sdk::PlayerSlotToClientPtr(slot);

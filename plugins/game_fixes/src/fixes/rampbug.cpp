@@ -18,6 +18,7 @@
 // reaches it (the interface has no instance; a pointer to its vtable stands in for one).
 
 #include "../fixes.hpp"
+#include "../map_gate.hpp"
 
 #include <cfloat>
 #include <cmath>
@@ -275,6 +276,13 @@ bool CRampbugFix::ResolveSlot(void* services, int* slot) const {
 }
 
 CRampbugFix::PlayerState* CRampbugFix::GetState(void* services, void** pawn) {
+	// PITFALLS B1/B2: GetClientPawn walks the client list, which s2sdk dereferences without a
+	// check before the first map and in the window between OnMapEnd and the next OnMapStart. The
+	// movement detours cannot normally fire there, but a level change is exactly when a stale
+	// callback must stay inert.
+	if (!IsMapReady()) {
+		return nullptr;
+	}
 	int slot = -1;
 	if (!ResolveSlot(services, &slot)) {
 		return nullptr;

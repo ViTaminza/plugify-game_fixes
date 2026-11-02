@@ -7,10 +7,10 @@ as the original.
 | | original (Metamod) | this port |
 |---|---|---|
 | source | the fork's `src/**` | `plugins/game_fixes/src/**` |
-| lines | 5909 (incl. the fork's private SDK headers and license banners) | 5287 across 23 files |
+| lines | 5909 (incl. the fork's private SDK headers and license banners) | 7983 across 47 files |
 | engine access | Metamod + its own `sdk/` reimplementations | s2sdk bindings + polyhook hooks |
 | signatures/offsets | hard-coded patterns per fix | one gamedata file, `assets/gamedata.jsonc` |
-| config | `addons/configs/game_fixes/game_fixes.ini` (KeyValues) | same file, parsed by pisexcompat's KeyValues |
+| config | `addons/configs/game_fixes/game_fixes.ini` (KeyValues) | same file, parsed by the plugin's own KV1 reader (src/kv1.cpp) |
 
 ## The fixes
 
@@ -76,9 +76,14 @@ marked *(gamedata)* are in `assets/gamedata.jsonc`; `server`/`engine2` are the g
    +0x10, root +0x18, count +0x1C, free head +0x20) verified against the current libserver.so
    disassembly. *(gamedata: the pass and map signatures + the map/node offsets.)*
 7. **team_limit** — the map's spawn points cap how many players may spawn per team, so a join gets
-   refused as "team full" on maps with few spawns. On every `round_start` the four
-   `CCSGameRules` fields (spawnable/max T and CT) are set to `maxplayers` *(schema offsets, read
-   at runtime)*.
+   refused as "team full" on maps with few spawns. On every `round_start` **post** (after the
+   game's own round-start handling, so it cannot put the map-derived numbers back) the six
+   `CCSGameRules` counters — `m_iNumSpawnableTerrorist/CT`, `m_iSpawnPointCount_Terrorist/CT`,
+   `m_iMaxNumTerrorists/CT` — are set to `maxplayers`. The offsets are resolved through
+   `GetSchemaOffset` at the first round start (never at plugin start) and written raw with
+   `SetEntData2`, width 4 from sdk.json; all six are `networked:false`, so `changeState=false`
+   (the reference's TeamLimitFix raises the same six fields). *(schema offsets, read at runtime;
+   by-name `SetEntSchema2` kept as a fallback if one field does not resolve.)*
 8. **input_activator_crash** — `CEntityIdentity::AcceptInput` → `CBaseFilter::InputTestActivator`
    dereferences the input's activator without checking it; a `TestActivator` input fired with no
    activator (a map's output wired straight to a filter) takes the server down. The port detours
@@ -87,8 +92,11 @@ marked *(gamedata)* are in `assets/gamedata.jsonc`; `server`/`engine2` are the g
    *(gamedata: the fork's `CEntityIdentity_AcceptInput` is shipped alongside, and so is the
    instance-level pattern (copied from s2sdk's own gamedata) — the plugin resolves its own copy.)*
 9. **sv_cheats** — watches the cvar (`FindConVar` + `HookConVarChange` via s2sdk) and, the moment
-   it flips to 0, puts every pawn still in `MOVETYPE_NOCLIP` back to `MOVETYPE_WALK`
-   (`SetClientMoveType`), which is the one thing the engine forgets to do.
+   it flips to 0, puts every pawn still in `MOVETYPE_NOCLIP` back to `MOVETYPE_WALK`. Both move
+   types are checked (`m_MoveType` via `GetClientMoveType`, `m_nActualMoveType` via its schema
+   offset, 1 byte) and both are written, like the reference SvCheatsFix and the C++ fork:
+   `SetClientMoveType` is the engine setter and networks `m_MoveType`; `m_nActualMoveType` is
+   non-networked and gets a raw `SetEntData` after it.
 10. **rampbug** — surf ramps: a movement trace landing on a ramp edge feeds `TryPlayerMove` a
     plane the player never hit and the player is flung off. The port is CS2KZ's fix as carried by
     CS2Fixes-RampbugFix: `CCSPlayer_MovementServices::TryPlayerMove` is detoured and the game's
@@ -120,21 +128,73 @@ marked *(gamedata)* are in `assets/gamedata.jsonc`; `server`/`engine2` are the g
     `max_per_second` messages swallow the message and (with `cooldown`) drop the client's voice
     for that long; `kick_strikes` catches within a minute of each other and `kick 1` kick the
     client. *(gamedata: protobuf offsets + vtable index.)*
-15. **server_list_players** — **not ported**, on purpose: s2sdk's own player manager already calls
+15. **voice_fix** — the client-side half of the reference VoiceFix (CS2VoiceFix): a client voice
+    message that carries no `audio` field is malformed and the reference drops it. s2sdk has no
+    inbound net-message hook, so this is a second Pre callback on the shared
+    `CServerSideClient::ProcessVoiceData` vtable hook: `_has_bits_` bit 0 clear → Supersede with
+    the "handled" bool return. It is independent of `voice_flood` (the polyhook hook is shared;
+    either block works with the other off) and does not change the flood policy.
+    *(gamedata: the CCLCMsg_VoiceData has-bits offset and the vtable index.)*
+16. **blank_map** — if `nextlevel_changed` arrives with an empty `nextlevel`, the server can drop
+    into an empty, unplayable state. The command is deferred one frame (issuing a changelevel
+    inside the event dispatch re-enters the match-end path): `changelevel <current map>` when
+    `IsMapValid`, `ds_workshop_changelevel <current map>` otherwise. Guarded by the map gate
+    (src/map_gate.hpp) and a pending flag — at most one restart per map, cleared on the next map
+    start; the map-end listener also drops the queued restart.
+17. **player_ghost** — a player can remain spectator while their body stays alive on the map. At
+    `round_freeze_end` every alive player whose **pawn** team is Spectator goes through
+    `ChangeClientTeam(None)` then `ChangeClientTeam(Spectator)` (the reference PlayerGhostFix),
+    with the client re-checked between the two calls and the whole pass gated on the map gate
+    (src/map_gate.hpp).
+18. **fake_messages** — advertising bots post a chat line without ever joining the game. Chat
+    (`say` / `say_team` only, case-insensitive exact names) is blocked while the client's signon
+    state is below `SIGNONSTATE_SPAWN`; every other client command, server console and GOTV pass.
+    The state comes from `OnClientSignonStateChanged` + `OnClientPutInServer` (cleared on
+    disconnect) and is seeded from `CServerSideClient::m_nSignonState` by a 1 s timer after a map
+    starts (also for a plugin loaded mid-map). The block uses the global command listener and
+    returns Handled, which makes s2sdk Supercede the command dispatch; no client is queried before
+    `IsGameReady`.
+19. **cstv_bot_quota** — `bot_quota_mode fill` can select the in-game SourceTV client for removal,
+    interrupting demo recording. While the native bot selector runs (thread-local depth > 0) the
+    shared `TeamCandidate` predicate returns false for an HLTV controller, so the selector moves on
+    to an ordinary bot; outside bot selection the predicate is untouched and bot settings are never
+    changed. `m_bIsHLTV` is read through its schema offset, resolved at runtime (2 s retry timer
+    after a map start, never at plugin start). Off by default. *(gamedata: the two engine
+    signatures, verified unique against the live libserver.so.)*
+20. **jump_spam** — a keybind macro fires several jump-button checks in one move tick, giving
+    bhop-like speed. `CheckJumpButtonModern/Legacy` Pre cancels when the player already jumped on
+    this `CMoveData` tick; `OnJumpModern/Legacy` Post records the tick of the jump that happened.
+    Slot resolution is direct in CheckJumpButton (`PlayerServicesToPlayerSlot`) and via a
+    thread-local set by the shared ProcessMovement detour for OnJump (its first argument is an
+    interior pointer). All four functions are signature detours verified unique on the live build;
+    `CMoveData::m_nTickCount` is 0xD4. **Off by default; never enable on bhop servers.**
+    *(gamedata: four code signatures + the tick offset.)*
+21. **server_list_players** — **not ported**, on purpose: s2sdk's own player manager already calls
     `ISteamGameServer::BUpdateUserData` for every client every 5 s, which is what this block (and
     its `update_interval`) exists for. Porting it would fight over the call; the block is logged
     and skipped.
 
 ## Config
 
-`assets/game_fixes.ini` is a byte copy of the fork's `configs/addons/game_fixes/game_fixes.ini`
-(same blocks, keys, comments and defaults). `slow_animation`'s forced reload is configured by
+`assets/game_fixes.ini` carries the fork's blocks, keys, comments and defaults, plus the blocks
+added for the reference Fixes port: `voice_fix` (on), `blank_map` (on), `player_ghost` (on),
+`fake_messages` (on), `cstv_bot_quota` (off) and `jump_spam` (off — never enable it on bhop
+servers). `slow_animation`'s forced reload is configured by
 `max_map_hours` (default 3 h; values in (0,1) are raised to 1, 0 disables it), `match_wait_minutes`
 (120) and `warn_minutes` (2), exactly as in the reference. Every block is `"enable"`-toggled; a
-disabled or failed fix logs why and the rest still load. The plugin resolves `game_fixes.ini`
-through pisexcompat: server working directory first, then
-`<configs>/game_fixes/game_fixes.ini`, then `<configs>/game_fixes.ini` (the packaged layout is
-`configs/game_fixes/game_fixes.ini`).
+disabled or failed fix logs why and the rest still load. `game_fixes.ini` is read by the plugin's
+own KV1 reader (`src/kv1.cpp`) and looked up in the same order `pisexcompat` used
+(`src/paths.cpp`): the server working directory first, then `<configs>/game_fixes/game_fixes.ini`
+(the packaged layout), then the shim's `translations/` and `<data>/game_fixes/` fallbacks. The
+per-fix defaults and floors live in `src/config.hpp` and are pinned by the tests.
+
+The packaged default is this checked-in file, never the fork work tree's copy: the fork's
+`game_fixes.ini` has only the original 14 fix blocks, so shipping it silently disabled `voice_fix`,
+`blank_map`, `player_ghost` and `fake_messages` on a fresh install (`tests/package_tests.cpp`
+guards that). A diff against both fork copies (the base checkout and the `game_fixes-slowmo` work
+tree) shows the shipped file is a strict superset: the shared blocks and every shared option value
+are identical, and the fork's slow-animation keys (`max_map_hours`, `match_wait_minutes`,
+`warn_minutes`) are included.
 
 The original registers no convars of its own; it *reads* `tv_enable`, `mp_timelimit`, `sv_cheats`
 and `sv_kick_players_with_cooldown`, and the port does the same through s2sdk's cvars, with no
@@ -148,7 +208,7 @@ new cvars.
 * The movement patches (`FixWaterFloorJumpPatch`, `ServerMovementUnlockPatch`,
   `BotNavIgnorePatch`) are commented out in s2sdk's gamedata, so water_jump/rampbug do not
   double-apply.
-* `server_list_players` — see fix 15.
+* `server_list_players` — see fix 21.
 * Where s2sdk hooks the same engine function, the port reuses the existing hook
   (`FindVirtual2`/`FindDetour` first, `s2sdk`-installed hooks included) instead of installing a
   second one: `INetworkServerService::StartupServer` (s2sdk has Post, this plugin adds Pre) and
@@ -170,24 +230,38 @@ new cvars.
 ```
 plugins/game_fixes/
   CMakeLists.txt              plugin + tests (build/tests/game_fixes_{signature_check,core}_tests)
-  game_fixes.pplugin.in       manifest (deps: s2sdk >= 2.18.2, polyhook >= 2.5.6, optional hudmenu)
-  sym/version_script.lds      exports Plugify_*, __s2sdk_*, __polyhook_*, __hudmenu_*
+  game_fixes.pplugin.in       manifest (deps: s2sdk >= 2.18.2, polyhook >= 2.5.6)
+  sym/version_script.lds      exports Plugify_*, __s2sdk_*, __polyhook_*
   package.sh                  build/package/game_fixes/{bin,configs,assets}
-  assets/gamedata.jsonc       signatures (10), offsets, vtables, the hammer-id patch
+  assets/gamedata.jsonc       signatures (17), offsets, vtables, the hammer-id patch
   assets/game_fixes.ini       the fork's config, byte for byte
   src/api.{hpp,cpp}           gamedata loading, hook helpers, environment resolution
   src/ban_map.hpp             the ban-map operations steam_ban performs (engine-free, tested)
+  src/config.{hpp,cpp}        the per-fix option readers, defaults and floors (tested)
+  src/kv1.{hpp,cpp}           the plugin's own KeyValues reader (tested)
   src/load_policy.hpp         when a fix may load (the schema-deferral rule, tested)
-  src/scheduler.{hpp,cpp}     universal time / timers / next-frame queue (the first tick after
-                              Init does not add the host's uptime: the reference's boot reload)
+  src/map_gate.{hpp,cpp}      the B1/B2 map readiness gate (tested)
+  src/output.hpp              the chat output helper (literal text, no language/phrase call)
+  src/paths.{hpp,cpp}         the config lookup order that replaced pisex::ResolvePath (tested)
+  src/scheduler.{hpp,cpp}     universal time / timers / next-frame queue; >= 1/64 s delays and
+                              the per-map delayed-work teardown (tested)
+  src/schema_cache.hpp        the map-gated, success-only schema offset cache (tested)
   src/slow_animation_logic.hpp  the engine-free max_map_hours watch (thresholds, ghost filter,
                               new-match/round-end decisions, warning schedule)
   src/fixes.hpp               CFix + IMovementListener interfaces
-  src/plugin.cpp              lifecycle, config, shared hooks (StartupServer Pre, movement detours)
-  src/fixes/*.cpp             one file per fix (14)
+  src/plugin.cpp              lifecycle, map gate, config, shared hooks (StartupServer Pre,
+                              movement detours)
+  src/*_logic.hpp             engine-free decision logic of each fix (team limit fields, sv_cheats
+                              value/move-type rule, voice bit test, ghost filter, chat/signon rule,
+                              blank-map command, CSTV depth rule, jump-tick rule) — tested
+  src/fixes/*.cpp             one file per fix (20)
   tests/signature_check_tests.cpp  ELF pattern scan: every gamedata pattern matches exactly once
-  tests/core_logic_tests.cpp       ban-map writes, scheduler semantics, the slow_animation watch,
-                                   Itanium index encoding
+  tests/package_tests.cpp          package.sh regression: the full checked-in config is shipped, temp
+                                   BUILD_DIR/OUT_DIR, symlink escapes (realpath + python fallback),
+                                   root build and server-tree denylist, server configs untouched
+  tests/core_logic_tests.cpp       ban-map writes, scheduler semantics + delayed-work teardown,
+                                   map gate, KV1 reader + shipped-config defaults, config paths,
+                                   schema cache, the slow_animation watch, Itanium index encoding
   tools/verify_signatures.py  standalone re-check of the same patterns (dev aid)
 ```
 
@@ -205,11 +279,12 @@ Fixed:
   the schema offsets are unresolved and never calls into the schema system at plugin start
   (`src/load_policy.hpp`, pinned by `tests/core_logic_tests.cpp` - the decision table that
   prevents this crash).
-* Schema resolution itself is gated on "a map is running" (our `StartupServer` Pre callback, or
-  pisexcompat's map-running state for a late plugin load) and is avoided during shutdown/
-  changelevel, when the entity network serializer info is torn down again.
+* Schema resolution itself is gated on the map gate (src/map_gate.hpp: open only from the first
+  `OnPluginUpdate` after a map started - or after a mid-map plugin load - and shut again on
+  `OnMapEnd`), so it is avoided during shutdown/changelevel, when the entity network serializer
+  info is torn down again.
 * No fix touches clients while a map is not running: `sv_cheats` (cvar changes also fire during
-  shutdown) checks `pisex::IsGameReady()` and then `PlayerSlotToClientPtr` - the one client lookup
+  shutdown) checks the map gate and then `PlayerSlotToClientPtr` - the one client lookup
   in s2sdk that is silent *and* checks the client list's count - before any move-type call;
   `slow_animation` reports "players present" instead of counting when no map runs; the three
   deferred kicks (`voice_flood`, `keyvalues_flood`, `team_switch_spam`) re-check map-running next
@@ -218,6 +293,41 @@ Fixed:
   `PlayerManager::Player::GetClient` -> `utils::GetClientBySlot`, whose `Element(slot)` is
   unchecked and crashes on the emptied client list). `IsClientInGame` alone is *not* a safe gate
   for the same reason - it is only used after the client-object check has passed.
+
+## Port off pisexcompat (2026-11-01)
+
+The plugin no longer links `pisexcompat` (docs/PLUGIN_STANDARD.md §7). No new wrapper library
+replaced it: the few helpers the shim provided are written into this plugin.
+
+* `pisex::KeyValues` -> `src/kv1.{hpp,cpp}`: the same KV1 grammar and the same
+  `GetInt`/`GetFloat`/`GetBool`/`GetString` semantics, so the production `game_fixes.ini` loads
+  unchanged; the tests parse the shipped file and pin every block and default.
+* `pisex::ResolvePath`/`pisex::FileExists` -> `src/paths.{hpp,cpp}`: the same candidate order
+  (working directory, `<configs>/game_fixes/`, the shim's `translations/` and `<data>/game_fixes/`
+  fallbacks), with the packaged location returned for the error log when nothing exists.
+* `pisex::IsGameReady`/`RegisterMapEndCallback`/`Poll` -> `src/map_gate.{hpp,cpp}` plus the
+  plugin's own `OnMapStart`/`OnMapEnd` listeners. The gate is shut at `OnPluginStart`, latched open
+  on the first `OnPluginUpdate` after `OnMapStart` (or after a mid-map plugin load) and shut again
+  on `OnMapEnd`; every client/entity/schema call of every fix checks it (PITFALLS B1/B2). The
+  listeners are registered in `OnPluginStart` and removed in `OnPluginEnd`.
+* `pisex::SchemaOffset` -> `src/schema_cache.hpp`: map-gated, success-only memoisation (a failed
+  lookup stays retryable; `Clear()` on unload).
+* pisexcompat timers -> the plugin's own `src/scheduler.cpp` pump from `OnPluginUpdate`. No timer
+  is created from inside a timer callback, and `AddTimer` floors every delay at 1/64 s
+  (PITFALLS C.9). On `OnMapEnd` every fix is told first (`CFix::OnMapEnd`: it drops its own
+  per-map timer/state, e.g. workshop_voice's registry lookup and cstv_bot_quota's selection
+  depth), then `scheduler::ClearDelayedWork` sweeps the queued next-frame kicks, the blank_map
+  restart and any remaining one-shot timer; repeating timers stay because their callbacks
+  re-check the map gate.
+* `pisex::PrintToChatAll` -> `src/output.hpp`: one literal line to every player, no phrase or
+  language API, so the plugin never switches the server language.
+* Manifest/export: the optional `hudmenu` dependency and the `__hudmenu_*` exports are gone
+  (PITFALLS A.4); the dependencies are `s2sdk` and `polyhook` only. Version 1.2.0.
+
+The hooks, their arguments, the gamedata (17 signatures, offsets, vtables, the one byte patch) and
+the detour ownership/teardown rules are unchanged. This change is verified by compilation and the
+offline tests only: it makes no claim about any crash that was observed on a live server, and
+nothing here was run against a game server.
 
 ## Crash-audit round
 
@@ -275,18 +385,45 @@ The full plugin set crashed a running server; every plugin was audited. Findings
   (`SendNetMessage`/`ProcessRespondCvarValue` are s2sdk's slots; the movement functions,
   `SetBeamOrigin/EndPos`, `CheckSteamBan` and `AcceptInput` are hooked by nobody else).
 
-The new `tests/core_logic_tests.cpp` (115 checks) covers the ban-map writes with canaries around
-header and nodes, the scheduler's timer/next-frame semantics (including the first-tick guard), the
-slow_animation watch's ghost filter / thresholds / fallback and warning schedule, and the Itanium
-index encoding.
+The new `tests/core_logic_tests.cpp` (379 checks) covers the ban-map writes with canaries around
+header and nodes, the scheduler's timer/next-frame semantics (including the first-tick guard, the
+1/64 s delay floor and the map-end `ClearDelayedWork`), the slow_animation watch's ghost filter /
+thresholds / fallback and warning schedule, the Itanium index encoding, and the decision logic of
+the newer fixes: the six team_limit fields, the sv_cheats value/move-type rule, the voice_fix
+audio bit, the player_ghost filter, the fake_messages chat-name/signon rule, the blank_map restart
+command, the cstv depth rule and the jump_spam tick comparison. The pisexcompat removal added
+coverage for the map gate transitions, the KV1 reader, the config defaults/floors of every
+configurable block and of the shipped `game_fixes.ini`, the config lookup order and the map-gated
+schema cache.
 
 ## Build, test, package
 
 ```sh
 ./build.sh plugify-game_fixes        # -> build/plugins/game_fixes/libgame_fixes.so
 ./test.sh                            # game_fixes_core_tests + game_fixes_signature_check_tests
+                                     # + game_fixes_package_tests
 bash plugins/game_fixes/package.sh   # -> build/package/game_fixes/
 ```
+
+`package.sh` ships the checked-in `assets/game_fixes.ini` — the complete 20-fix config — and reads
+nothing under `ref/`. The fork work tree's `game_fixes.ini` must not be used: it carries only the
+original 14 fix blocks, so a package built from it silently disabled `voice_fix`, `blank_map`,
+`player_ghost` and `fake_messages` (all enabled in the plugin's config) on every fresh standalone
+install. `tests/package_tests.cpp` pins this: it runs the real script in a throwaway
+`BUILD_DIR`/`OUT_DIR` with fake build artifacts and checks the byte-identical config, every fix
+block and enable flag, the full package layout, and that an existing server config is never
+touched. `package.sh` deletes and rebuilds its output, so it resolves `BUILD_DIR`/`OUT_DIR`
+through symlinks first (`realpath -m`, or `os.path.realpath` when `realpath` is unavailable - never
+`os.path.abspath`, which would let a link inside the build tree point at a server directory) and
+refuses: `OUT_DIR` outside or equal to `BUILD_DIR`, `/` as either path, and any `OUT_DIR` inside a
+known server tree (`/srv/cs2-go`, `/var/lib/pterodactyl`; `GAME_FIXES_SERVER_ROOTS` may extend the
+list). The tests cover a symlink escape with both the realpath and the python fallback, the root
+build and the server-tree denylist. A deploy copies the packaged `configs/` with `cp -n`, so a
+server's edited `configs/game_fixes/game_fixes.ini` (enable flags, whitelist, limits) always
+survives an update.
+That also means an upgraded server keeps its old config: to turn on the fixes its config predates,
+the operator merges the missing blocks from `assets/game_fixes.ini` by hand (the plugin logs each
+missing block as "disabled").
 
 `tests/signature_check_tests.cpp` also dumps, into `SIGSCAN.md`, the xrefs of the strings around
 the two ban functions, which is how the two re-derived patterns were verified.
@@ -294,8 +431,9 @@ the two ban functions, which is how the two re-derived patterns were verified.
 ## Needs a running-server check (not verifiable offline)
 
 1. Re-run the signature scan against the game's own `libserver.so` (the workspace copies may be
-   older; `./test.sh` reads those when the game install is not mounted). All 10 patterns matched
-   exactly once there. Also re-check `SIGSCAN.md`'s VAs against the running module base.
+   older; `./test.sh` reads those when the game install is not mounted). All 17 linuxsteamrt64
+   server signatures were re-checked against the live `libserver.so` on 2026-11-01 and match
+   exactly once. Also re-check `SIGSCAN.md`'s VAs against the running module base.
 2. That the hammer-id patch byte is written (log line "patch bytes now 'EB'") and that entities
    really carry unique hammer ids.
 3. That the hooks fire: `disconnect` on a GOTV client with `tv_enable 1`, `StartupServer` max-
@@ -316,3 +454,13 @@ the two ban functions, which is how the two re-derived patterns were verified.
    round-end/10-minute-grace path. A player who leaves (`[NoChan]` in `status`) must not keep the
    map alive, while a player who is still connecting must postpone the reload. Also verify the
    `curtime did not reset` guard does not trip after a normal forced reload.
+8. New fixes: `team_limit` must let more players join a map with fewer spawns than slots (the two
+   spawn-point counters are written now); `sv_cheats 0` must reset a pawn whose
+   `m_nActualMoveType` alone is noclip; `voice_fix` must drop a client's empty (no-audio) voice
+   packets while normal voice still works, with `voice_flood` both on and off; `fake_messages`
+   must block a `say` sent before signon SPAWN, allow it after joining, and never touch other
+   commands, the server console or GOTV; `blank_map` must restart exactly once when the match ends
+   with an empty nextlevel and must not loop; `player_ghost` must clear a test ghost's leftover
+   body; `cstv_bot_quota` (enable it for the test) with `bot_quota_mode fill` and `tv_enable 1`
+   must log the skip once per map and leave the demo recording alive; `jump_spam` stays off in
+   production — test the macro on a throwaway server only.

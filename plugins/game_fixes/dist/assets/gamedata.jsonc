@@ -73,6 +73,54 @@
         "win64": "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 4C 89 60 20 55 41 56 41 57 48 8D A8 68 FE FF FF",
         "linuxsteamrt64": "48 B8 ? ? ? ? ? ? ? ? 55 66 0F EF C0 48 89 E5 41 57 41 56 41 55 4C 8D AD ? ? ? ? 41 54 49 89 FC 4C 89 EF 53 48 89 F3 48 81 EC ? ? ? ? 48 89 85 ? ? ? ? 48 8B 05 ? ? ? ? 0F 29 85 ? ? ? ? 48 C7 85 ? ? ? ? ? ? ? ? 48 C7 45 ? ? ? ? ? 48 89 85 ? ? ? ? 48 B8 ? ? ? ? ? ? ? ? 48 89 45 ? E8 ? ? ? ? 48 8D 8D"
       },
+      // bool CCSPlayer_MovementServices::CheckJumpButtonLegacy(CMoveData* mv) (jump_spam)
+      // Derived from the live build: this is the function that contains the only direct call to
+      // OnJumpLegacy (the call at file offset 0x15F1B68); it ends with `mov eax,1`, i.e. it
+      // returns whether the jump was taken. Unique match. No Windows pattern was derived.
+      "CCSPlayer_MovementServices_CheckJumpButtonLegacy": {
+        "library": "server",
+        "win64": "TODO",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 81 EC ? ? ? ? 48 8B 7F 38"
+      },
+      // bool CCSPlayer_MovementServices::CheckJumpButtonModern(CMoveData* mv) (jump_spam)
+      // Derived from the live build: the only tail-jump to OnJumpModern (`E9` at file offset
+      // 0x15B571E) leaves this function; its prologue reads CMoveData::m_nTickCount at [rsi+0xD4].
+      // Unique match. No Windows pattern was derived.
+      "CCSPlayer_MovementServices_CheckJumpButtonModern": {
+        "library": "server",
+        "win64": "TODO",
+        "linuxsteamrt64": "55 48 89 E5 41 57 49 89 FF 41 56 41 55 41 54 53 48 89 F3 48 83 EC ? 48 8B 7F 08"
+      },
+      // void CCSPlayer_MovementServices::OnJumpLegacy(CCSPlayerLegacyJump*, CMoveData*) (jump_spam)
+      // CS2AC's pattern (ref-cs2ac/legacy/gamedata/cs2ac.games.txt); unique on the live build.
+      "CCSPlayer_MovementServices_OnJumpLegacy": {
+        "library": "server",
+        "win64": "TODO",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 83 EC 18 4C 8B 67 38 4D 85 E4"
+      },
+      // void CCSPlayer_MovementServices::OnJumpModern(CCSPlayerModernJump*, CMoveData*) (jump_spam)
+      // CS2AC's pattern; unique on the live build.
+      "CCSPlayer_MovementServices_OnJumpModern": {
+        "library": "server",
+        "win64": "TODO",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 81 EC ? ? ? ? 4C 8B 77 ? 4D 8B 66"
+      },
+      // The native bot-quota pair (cstv_bot_quota), from the SwiftlyS2 Fixes reference gamedata.
+      // Both were checked against the live libserver.so: one match each.
+      // bool SelectAndKickBot(int team): search for "fill_with_minimum"; the helper is called
+      // with teams 0, 2 and 3.
+      "CstvBotQuotaFix_SelectAndKickBot": {
+        "library": "server",
+        "win64": "48 89 5C 24 18 55 56 57 41 56 41 57 48 8B EC 48 83 EC 50 8B F9 89 4D 38 48 8D 4D 38 C7 45 3C 01 00 00 00 48 8D 55 E8 E8 ? ? ? ?",
+        "linuxsteamrt64": "55 48 89 E5 41 57 41 56 41 55 41 89 FD 41 54 53 48 83 EC 58 4C 8D 25 ? ? ? ? 89 7D A0 C7 45 90 00 00 00 00 C7 45 A4 01 00 00 00 49 8B 04 24 8B 50 10 85"
+      },
+      // bool TeamCandidate(void* filter, CBaseEntity* controller, CBaseEntity* pawn): compares
+      // *(int*)filter with each candidate's m_iTeamNum and returns false on mismatch.
+      "CstvBotQuotaFix_TeamCandidate": {
+        "library": "server",
+        "win64": "48 85 D2 74 0E 0F B6 82 ? ? ? ? 39 01 74 03 32 C0 C3 4D 85 C0 74 0E 41 0F B6 80 ? ? ? ? 39 01 0F 94 C0 C3 B0 01 C3",
+        "linuxsteamrt64": "48 85 F6 74 13 0F B6 8E ? ? ? ? 31 C0 39 0F 74 06 C3 0F 1F 44 00 00 B8 01 00 00 00 48 85 D2 74 F0 0F B6 82 ? ? ? ? 39 07 0F 94 C0 C3"
+      },
       // void GameSystem_Think_CheckSteamBan() — the engine's per-frame GC-ban / cooldown kick pass.
       "GameSystem_Think_CheckSteamBan": {
         "library": "server",
@@ -147,6 +195,12 @@
         "win64": 2,
         "linuxsteamrt64": 2
       },
+      // SignonState_t::SIGNONSTATE_SPAWN: from here on the client has joined the game and may
+      // chat (fake_messages uses it as the reference's InGame threshold).
+      "SIGNONSTATE_SPAWN": {
+        "win64": 5,
+        "linuxsteamrt64": 5
+      },
       // SVC_Messages::svc_VoiceData (netmessages.proto). The engine registers its user messages
       // only once the server is up, so the id cannot be looked up at plugin load; this is the
       // protocol constant the fork's own build carries (its DWARF shows 47). The registry lookup
@@ -169,6 +223,13 @@
       "CMoveData_m_vecAbsOrigin": {
         "win64": 200,
         "linuxsteamrt64": 200
+      },
+      // CMoveDataBase::m_nTickCount (jump_spam): int32 right after m_vecAbsOrigin in the CS2
+      // CMoveDataBase layout (ref-cs2ac/legacy/src/sdk/datatypes.h), confirmed by the live
+      // CheckJumpButtonModern prologue reading [rsi+0xD4].
+      "CMoveData_m_nTickCount": {
+        "win64": 212,
+        "linuxsteamrt64": 212
       },
       // --- protobuf message layouts the flood fixes inspect. The client message objects are
       //     [CNetMessage][protobuf]; these are the offsets of the protobuf fields *within that

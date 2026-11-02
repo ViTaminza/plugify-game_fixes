@@ -254,10 +254,11 @@ int Run() {
 	Binary engine;
 	const bool haveServer = server.Load(kServerSo);
 	const bool haveEngine = engine.Load(kEngineSo);
-	std::ofstream report(kReport);
-	const bool haveReport = report.is_open();
 
 	if (!haveServer && !haveEngine) {
+		// The report is opened after this check on purpose: truncating it here would wipe the
+		// committed report in every checkout without game binaries, leaving a tracked file
+		// modified after a plain test run.
 		std::printf("game_fixes signature check: SKIP (no game binaries at %s)\n", kServerSo);
 		return 0;
 	}
@@ -267,6 +268,8 @@ int Run() {
 		std::printf("game_fixes signature check: FAIL (gamedata not found at %s)\n", kGamedata);
 		return 1;
 	}
+	std::ofstream report(kReport);
+	const bool haveReport = report.is_open();
 	std::stringstream buffer;
 	buffer << file.rdbuf();
 	const nlohmann::json gamedata = nlohmann::json::parse(StripComments(buffer.str()));

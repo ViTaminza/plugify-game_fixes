@@ -22,7 +22,7 @@
 #include <polyhook/polyhook.hpp>
 #include <s2sdk/s2sdk.hpp>
 
-#include <pisex/paths.hpp>
+#include "paths.hpp"
 
 namespace game_fixes {
 
@@ -162,7 +162,7 @@ struct Gamedata {
 					 base + "../assets/gamedata.jsonc",
 					 base + "game_fixes/gamedata.jsonc",
 				 }) {
-				if (pisex::FileExists(candidate)) {
+				if (FileExists(candidate)) {
 					paths.push_back(candidate);
 				}
 			}
@@ -264,6 +264,14 @@ struct Environment {
 	void* banMap = nullptr;
 	void* fnSetBeamOrigin = nullptr;
 	void* fnSetBeamEndPos = nullptr;
+	// jump_spam (server movement functions; s2sdk exposes no GameHooks for them)
+	void* fnCheckJumpButtonLegacy = nullptr;
+	void* fnCheckJumpButtonModern = nullptr;
+	void* fnOnJumpLegacy = nullptr;
+	void* fnOnJumpModern = nullptr;
+	// cstv_bot_quota (native bot selection / its candidate predicate)
+	void* fnCstvSelectAndKickBot = nullptr;
+	void* fnCstvTeamCandidate = nullptr;
 	// offsets
 	std::int32_t idxStartupServer = -1;
 	std::int32_t idxDisconnect = -1;
@@ -278,12 +286,14 @@ struct Environment {
 	std::int32_t offUserId = -1;
 	std::int32_t offIsHLTV = -1;
 	std::int32_t signonStateConnected = -1;
+	std::int32_t signonStateSpawn = -1;
 	// SVC_Messages::svc_VoiceData (protocol constant; the registry lookup is preferred when it
 	// answers, this is the fallback for the window before the server registers its messages)
 	std::int32_t offVoiceDataMessageId = 47;
 	std::int32_t offSessionMaxPlayers = -1;
 	std::int32_t offMoveVelocity = -1;
 	std::int32_t offMoveAbsOrigin = -1;
+	std::int32_t offMoveTickCount = -1;
 	// protobuf message layouts of the client messages the flood fixes inspect (offsets relative
 	// to the message object the vtable method receives; see README.md for the provenance)
 	std::int32_t offVoiceHasBits = -1;

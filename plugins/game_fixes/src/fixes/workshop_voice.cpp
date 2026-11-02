@@ -11,8 +11,8 @@
 // engine ABI work.
 
 #include "../fixes.hpp"
-
-#include <pisex/keyvalues.hpp>
+#include "../map_gate.hpp"
+#include "../scheduler.hpp"
 
 #include <random>
 
@@ -20,6 +20,11 @@ namespace game_fixes {
 namespace {
 
 constexpr int kMaxSlots = 64;
+
+// How long after a map start the registry lookup is made. The lookup cannot run in the
+// StartupServer Pre callback (the engine registers its network messages later in that startup, and
+// not at all at plugin load), so it is retried once the map is running.
+constexpr float kRegistryRetryDelay = 1.0f;
 
 class CWorkshopVoiceFix final : public CFix {
 public:
@@ -30,6 +35,7 @@ public:
 	bool Load() override;
 	void Unload() override;
 	void OnStartupServer(const char* mapName) override;
+	void OnMapEnd() override;
 
 private:
 	static void OnSendNetMessage(int32_t playerSlot, void* userMessage);
@@ -38,6 +44,9 @@ private:
 	// registry lookup at every map start — at plugin load the engine has not registered its user
 	// messages yet, so the lookup cannot be the only source).
 	bool IsVoiceData(void* userMessage) const;
+
+	// The registry lookup, made once the map is up (see kRegistryRetryDelay).
+	void LookUpMessageId();
 
 	uint64_t SeedForRecipient(int slot);
 
@@ -56,9 +65,11 @@ private:
 	// the registry lookup at every map start (never a per-message lookup: the listener runs for
 	// every outgoing message on the game thread).
 	int32_t m_voiceDataId = 0;
-	// The registry lookup is only worth one retry after the server is up (it warns when the name
-	// is not registered, and one map start is enough to tell).
+	// The registry lookup is retried at every map start until it answers (it logs a warning when
+	// the name is not registered); one successful lookup is enough for the process.
 	bool m_registryChecked = false;
+	// The one-shot lookup scheduled by the last OnStartupServer; killed on unload.
+	scheduler::Timer* m_registryTimer = nullptr;
 };
 
 CWorkshopVoiceFix* CWorkshopVoiceFix::s_instance = nullptr;
@@ -137,12 +148,14 @@ bool CWorkshopVoiceFix::Load() {
 		return false;
 	}
 	LogFix(Name(), Format("rewriting svc_VoiceData xuids through the s2sdk OnSendNetMessage listener "
-						  "(message id %d; the registry lookup refines it at the first map start)",
+						  "(message id %d; the registry lookup refines it once a map is up)",
 						  m_voiceDataId));
 	return true;
 }
 
 void CWorkshopVoiceFix::Unload() {
+	scheduler::KillTimer(m_registryTimer);
+	m_registryTimer = nullptr;
 	if (__s2sdk_OnSendNetMessage_Unregister) {
 		s2sdk::OnSendNetMessage_Unregister(&CWorkshopVoiceFix::OnSendNetMessage);
 	}
@@ -154,16 +167,40 @@ void CWorkshopVoiceFix::OnStartupServer(const char* mapName) {
 	std::memset(m_playerSeeds, 0, sizeof(m_playerSeeds));
 	m_loggedFirstRewrite = false;
 
-	// The server (and with it the user message registry) is up from here on: the registered id
-	// replaces the protocol constant, so a build whose enum moved is picked up automatically.
-	if (!m_registryChecked && __s2sdk_UserMessageFindMessageIdByName) {
-		m_registryChecked = true;
-		const int32_t registered = s2sdk::UserMessageFindMessageIdByName("svc_VoiceData");
-		if (registered > 0 && registered != m_voiceDataId) {
-			LogFix(Name(), Format("svc_VoiceData message id from the registry: %d (was %d)", registered,
-								  m_voiceDataId));
-			m_voiceDataId = registered;
-		}
+	// The registry cannot be asked yet: this runs in the StartupServer Pre callback, before the
+	// engine (and s2sdk) register their network messages. Retry once the map is live; a failed
+	// lookup is not latched, so the next map start tries again.
+	if (m_registryChecked) {
+		return;
+	}
+	scheduler::KillTimer(m_registryTimer);
+	m_registryTimer = scheduler::AddTimer(kRegistryRetryDelay, [this]() {
+		m_registryTimer = nullptr;
+		LookUpMessageId();
+	});
+}
+
+void CWorkshopVoiceFix::OnMapEnd() {
+	// The registry lookup is per-map delayed work. Dropping it here (before the plugin's final
+	// scheduler sweep) keeps the member from pointing at a timer the sweep would delete, and the
+	// next map's StartupServer arms it again (PITFALLS B2: no client is touched).
+	scheduler::KillTimer(m_registryTimer);
+	m_registryTimer = nullptr;
+}
+
+void CWorkshopVoiceFix::LookUpMessageId() {
+	if (m_registryChecked || !__s2sdk_UserMessageFindMessageIdByName || !IsMapReady()) {
+		return;
+	}
+	const int32_t registered = s2sdk::UserMessageFindMessageIdByName("svc_VoiceData");
+	if (registered <= 0) {
+		return; // still not registered: the next map start has another go
+	}
+	m_registryChecked = true;
+	if (registered != m_voiceDataId) {
+		LogFix(Name(), Format("svc_VoiceData message id from the registry: %d (was %d)", registered,
+							  m_voiceDataId));
+		m_voiceDataId = registered;
 	}
 }
 

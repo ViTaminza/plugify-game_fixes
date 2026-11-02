@@ -52,6 +52,23 @@ inline bool CountsAsHuman(int connectedState) {
 // not land right in the middle of a level change.
 inline constexpr double kIdleBeforeReload = 300.0;
 
+// How often the last-human stamp is sampled. The empty-server check itself only runs every
+// reload_interval (30 min by default), so a stamp refreshed only there is already that old when
+// the server happens to empty shortly before the next check, and the pause never gets to fire.
+inline constexpr double kHumanCheckInterval = 5.0;
+
+// Refreshes the last-human stamp: only a sample taken while a map is ready and with a human on it
+// counts. A sample from a map change must not (CountPlayers reports a player there on purpose),
+// or every level change would restart the idle pause.
+inline double RefreshLastHuman(double lastHumanSeen, double now, bool gameReady, int humans) {
+	return (gameReady && humans > 0) ? now : lastHumanSeen;
+}
+
+// True when nobody has been on the server for kIdleBeforeReload, or nobody was ever seen.
+inline bool EmptyLongEnough(double now, double lastHumanSeen) {
+	return lastHumanSeen <= 0.0 || now - lastHumanSeen >= kIdleBeforeReload;
+}
+
 // How often the max_map_hours watch runs. Short enough to catch a round end inside
 // mp_round_restart_delay; a few field reads per run.
 inline constexpr double kWatchInterval = 2.0;
